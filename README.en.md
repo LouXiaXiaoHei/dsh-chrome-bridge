@@ -118,7 +118,7 @@ Each action tries three channels in order and stops at the first success:
 
 **CDP is the main path.** The event sequence matches a real click (`pointerover → pointermove → pointerdown → mousedown(buttons=1, detail=1) → pointerup → mouseup → click`), it works while Chrome is in the background, it never switches your tab, and the system pointer does not move — press, move and release all happen inside the browser.
 
-**The native channel covers** what CDP cannot reach: semantics that only live in the accessibility tree (scrolling an element into view by name) and pages where debugging is blocked. Clicking and typing by name now go through CDP first — the page is scored on `aria-label`, placeholder and visible text, and the resulting point is clicked for real — so they work on Windows too and draw the same pointer.
+**The native channel covers** what CDP cannot reach: semantics that only live in the accessibility tree (scrolling an element into view by name) and pages where debugging is blocked. Clicking and typing by name now go through CDP first — the page is scored on `aria-label`, placeholder and visible text, and the resulting point is clicked for real — so they work on Windows too, and the on-page pointer still glides to the target and presses.
 
 | Native operation | Implementation | Trusted | Moves the system pointer | Needs Chrome in front |
 | --- | --- | --- | --- | --- |
@@ -137,7 +137,9 @@ Drag is the one case that cannot avoid global events: a press delivered through 
 
 ## The pointer on the page
 
-Every action draws a pointer on the page: it glides to the target, presses (darkens with a ripple), and releases, then stays there bobbing gently.
+The moment a tab is taken over, the pointer appears on the page: it lands in the middle of the viewport and ripples once. It then stays for the whole takeover — gliding to the target, pressing (darkened, with a ripple), releasing, bobbing where it stopped. Navigate to a new page or let a framework replace the DOM, and it is put back; it only leaves when the takeover moves to another tab or the debugger channel drops.
+
+It signals the state "this tab is being driven", not a decoration drawn for one tool call.
 
 It is a DOM element (`#__dsh_ai_cursor`), not the system cursor. The plugin stacks no window on your screen and never moves the real pointer for you:
 

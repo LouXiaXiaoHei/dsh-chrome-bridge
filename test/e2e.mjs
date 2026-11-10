@@ -247,6 +247,34 @@ try {
     const navigated = await call('page.navigate', { tabId, url: `${fixtureUrl}?second=1` })
     check('page.navigate accepts a tab id and url', navigated.url?.includes('second=1'), JSON.stringify(navigated))
 
+    /* -------------------------------------------------- 指针的接管期 */
+
+    // 光标代表“这个标签页正在被接管”：CDP 接上的那一刻它就该在页面上，
+    // 导航换掉整个文档之后仍然在，只有解除接管才离开。
+    await call('page.release', { tabId })
+    const beforeTakeover = await call('page.query', { tabId, selector: '#__dsh_ai_cursor' })
+    check('解除接管后页面上没有指针', beforeTakeover.count === 0, JSON.stringify(beforeTakeover.count))
+
+    await call('page.cdp', {
+      tabId,
+      calls: [{ method: 'Input.dispatchMouseEvent', params: { type: 'mouseMoved', x: 360, y: 240, buttons: 0 } }],
+    })
+    await sleep(400)
+    const onAttach = await call('page.query', { tabId, selector: '#__dsh_ai_cursor' })
+    check('CDP 接管的那一刻指针就在页面上', onAttach.count === 1, JSON.stringify(onAttach.count))
+
+    await call('page.navigate', { tabId, url: `${fixtureUrl}?third=1` })
+    await sleep(1800)
+    const afterNav = await call('page.query', { tabId, selector: '#__dsh_ai_cursor' })
+    check('导航换掉文档之后指针被补回来', afterNav.count === 1, JSON.stringify(afterNav.count))
+
+    const engaged = await call('page.engage', { tabId })
+    check('page.engage 报告接管成立与指针在位', engaged.attached === true && engaged.cursor?.ok === true, JSON.stringify(engaged))
+
+    await call('page.release', { tabId })
+    const afterRelease = await call('page.query', { tabId, selector: '#__dsh_ai_cursor' })
+    check('解除接管后指针离开', afterRelease.count === 0, JSON.stringify(afterRelease.count))
+
     /* ---------------------------------------------------------- screenshot */
 
     const shot = await call('page.screenshot', { tabId }, 30_000)

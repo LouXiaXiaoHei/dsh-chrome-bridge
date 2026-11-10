@@ -305,13 +305,24 @@ function fnWaitProbe(payload) {
 // The pointer the user sees while the agent works. It lives inside the page, so it
 // can never float over another application — and because it is only decoration it
 // opts out of hit testing entirely.
+//
+// 光标代表“这个标签页正在被接管”，所以它的生命周期跟接管一样长：接管开始时创建，
+// 中途只移动、不消失，解除接管时才移除。每次调用都先补齐元素，移动只是附带动作。
 function fnCursor(payload) {
   const ID = '__dsh_ai_cursor'
   const STYLE_ID = '__dsh_ai_cursor_style'
+  const p = payload || {}
   const existing = document.getElementById(ID)
-  if (payload && payload.mode === 'hide') {
+  if (p.mode === 'release') {
     if (existing) existing.remove()
-    return { ok: true, hidden: true }
+    const style = document.getElementById(STYLE_ID)
+    if (style) style.remove()
+    const guard = window.__dshAiCursorGuard
+    if (guard !== undefined) {
+      guard.disconnect()
+      window.__dshAiCursorGuard = undefined
+    }
+    return { ok: true, released: true }
   }
 
   if (!document.getElementById(STYLE_ID)) {
@@ -334,8 +345,12 @@ function fnCursor(payload) {
   }
 
   let root = existing
-  const x = Number(payload && payload.x)
-  const y = Number(payload && payload.y)
+  const askedX = Number(p.x)
+  const askedY = Number(p.y)
+  const hasPoint = Number.isFinite(askedX) && Number.isFinite(askedY)
+  // 接管那一刻还没有任何操作，没人给出坐标，就落在视口中心——最不突兀的起点。
+  const x = hasPoint ? askedX : Math.round(window.innerWidth / 2)
+  const y = hasPoint ? askedY : Math.round(window.innerHeight / 2)
   if (!root) {
     root = document.createElement('div')
     root.id = ID
@@ -347,17 +362,29 @@ function fnCursor(payload) {
       '<path d="M1.7 1.3 L1.7 20.2 L6.8 15.5 L10.1 23.1 L13.3 21.7 L10 14.1 L16.7 13.8 Z" ' +
       'fill="#111111" stroke="#ffffff" stroke-width="1.7" stroke-linejoin="round"/>' +
       '</svg></div><span class="__ring"></span>'
-    ;(document.body || document.documentElement).appendChild(root)
+    // 挂在 html 上而不是 body：单页应用首屏水合时经常整个替换 body，光标会跟着没。
+    ;(document.documentElement || document.body).appendChild(root)
     void root.offsetWidth
     root.style.transition = ''
-  } else if (Number.isFinite(x) && Number.isFinite(y)) {
+    // 仍然可能有框架重排 html 的子节点，守望一次，把被挤掉的光标放回原处，
+    // 这样“接管期间光标一直在”不依赖任何操作的时机。
+    if (window.__dshAiCursorGuard === undefined) {
+      const home = () => document.documentElement || document.body
+      const guard = new MutationObserver(() => {
+        const el = document.getElementById(ID)
+        if (el && !el.isConnected && home()) home().appendChild(el)
+      })
+      guard.observe(document.documentElement, { childList: true })
+      window.__dshAiCursorGuard = guard
+    }
+  } else if (hasPoint) {
     root.style.transform = `translate3d(${x - 1.6}px, ${y - 1.2}px, 0)`
   }
 
-  if (payload && payload.pressed === true) root.classList.add('__press')
+  if (p.pressed === true) root.classList.add('__press')
   else root.classList.remove('__press')
 
-  if (payload && payload.pulse === true) {
+  if (p.pulse === true) {
     const ring = root.querySelector('.__ring')
     if (ring) {
       ring.style.animation = 'none'
@@ -365,7 +392,8 @@ function fnCursor(payload) {
       ring.style.animation = '__dsh_ai_ring 420ms ease-out'
     }
   }
-  return { ok: true, x: Number.isFinite(x) ? x : null, y: Number.isFinite(y) ? y : null }
+  // created 为真表示这一次调用才把光标放上去，调用方可以据此判断接管是否刚刚成立。
+  return { ok: true, created: existing === null, x, y }
 }
 
 function fnMetrics() {
@@ -462,6 +490,17 @@ async function capture(tabId) {
 // so isTrusted is true and no synthetic-event sniffing can tell them apart.
 const debuggees = new Set()
 
+/**
+ * 已经挂着常驻光标的标签页。光标是“这个标签页正在被接管”的标志，
+ * 所以它跟着接管走：接管开始就创建，期间一直存在，解除接管才移除。
+ */
+const engagedTabs = new Set()
+
+// 正在进行的 attach，按标签页。host 在选定标签的那一刻就点亮光标，紧跟其后的
+// 第一个操作往往同时要求接管，两次 attach 会撞上 “Another debugger is already
+// attached”。
+const attaching = new Map()
+
 // The API only exists once Chrome grants the debugger permission, so touching it at
 // the top level would take the whole service worker down on an older install.
 function debuggerApi() {
@@ -474,16 +513,65 @@ function debuggerApi() {
 
 async function attachDebugger(tabId) {
   if (debuggees.has(tabId)) return
-  const api = debuggerApi()
-  try {
-    await api.attach({ tabId }, '1.3')
-  } catch (error) {
-    const message = String(error && error.message ? error.message : error)
-    if (!/already attached/i.test(message)) {
-      throw new Error(`无法接管标签页 ${tabId} 的调试通道：${message}`)
+  const inflight = attaching.get(tabId)
+  if (inflight !== undefined) return inflight
+  const work = (async () => {
+    const api = debuggerApi()
+    try {
+      await api.attach({ tabId }, '1.3')
+    } catch (error) {
+      const message = String(error && error.message ? error.message : error)
+      if (!/already attached/i.test(message)) {
+        throw new Error(`无法接管标签页 ${tabId} 的调试通道：${message}`)
+      }
     }
+    debuggees.add(tabId)
+    // CDP 接管的这一刻，光标就该出现在页面上——之后整段接管期它都在，
+    // 不等到第一次点击才凭空冒出来。
+    engagedTabs.add(tabId)
+    void ensureCursor(tabId)
+  })()
+  attaching.set(tabId, work)
+  try {
+    await work
+  } finally {
+    if (attaching.get(tabId) === work) attaching.delete(tabId)
   }
-  debuggees.add(tabId)
+}
+
+async function ensureCursor(tabId, payload) {
+  try {
+    return await runInPage(tabId, fnCursor, payload === undefined ? {} : payload)
+  } catch {
+    // 内部页面注入不了；光标只是装饰，不该让接管因此失败。
+    return undefined
+  }
+}
+
+/** 接管一个标签页：接上 CDP、把常驻光标放到视口中心，涟漪一次表示接管开始。 */
+async function engageTab(tabId) {
+  engagedTabs.add(tabId)
+  let attached = false
+  try {
+    await attachDebugger(tabId)
+    attached = debuggees.has(tabId)
+  } catch {
+    // 被 DevTools 占着时 CDP 接不上，但光标仍然代表“这个标签页在被操作”。
+  }
+  const cursor = await ensureCursor(tabId, { pulse: true })
+  return { attached, cursor }
+}
+
+/** 解除接管：撤掉光标，放开调试通道。 */
+async function releaseTab(tabId) {
+  engagedTabs.delete(tabId)
+  debuggees.delete(tabId)
+  await ensureCursor(tabId, { mode: 'release' })
+  try {
+    await debuggerApi().detach({ tabId })
+  } catch {
+    // 本来就没接上，或者标签页已经关掉了。
+  }
 }
 
 async function sendCdp(tabId, method, params) {
@@ -495,12 +583,26 @@ async function sendCdp(tabId, method, params) {
 // next call re-attaches instead of failing forever.
 try {
   chrome.debugger.onDetach.addListener((source) => {
-    if (typeof source.tabId === 'number') debuggees.delete(source.tabId)
+    if (typeof source.tabId !== 'number') return
+    debuggees.delete(source.tabId)
+    // 调试通道断了（用户打开了 DevTools 等），接管随之结束，光标也不该留在页面上。
+    if (engagedTabs.delete(source.tabId)) void ensureCursor(source.tabId, { mode: 'release' })
   })
 } catch {
   // 没有 debugger 权限，CDP 通道自动退化为不可用。
 }
-chrome.tabs.onRemoved.addListener((tabId) => debuggees.delete(tabId))
+chrome.tabs.onRemoved.addListener((tabId) => {
+  debuggees.delete(tabId)
+  engagedTabs.delete(tabId)
+})
+
+// 导航会换掉整个文档，光标元素跟着消失。接管期间补回来，所以打开新页面
+// 之后不用等下一次点击，光标就已经在新文档的视口中心了。
+chrome.tabs.onUpdated.addListener((tabId, info) => {
+  if (info.status !== 'complete') return
+  if (!engagedTabs.has(tabId)) return
+  void ensureCursor(tabId)
+})
 
 const METHODS = {
   async ping() {
@@ -543,8 +645,21 @@ const METHODS = {
     }
     return { results, attached: true }
   },
+  async 'page.engage'(params) {
+    const tabId = Number(params.tabId)
+    if (!Number.isFinite(tabId)) throw new Error('page.engage needs a numeric tabId')
+    const outcome = await engageTab(tabId)
+    return { ok: true, attached: outcome.attached, cursor: outcome.cursor }
+  },
+  async 'page.release'(params) {
+    const tabId = Number(params.tabId)
+    if (!Number.isFinite(tabId)) throw new Error('page.release needs a numeric tabId')
+    await releaseTab(tabId)
+    return { ok: true, released: true }
+  },
   async 'page.cursor'(params) {
-    return runInPage(params.tabId, fnCursor, params.payload === undefined ? {} : params.payload)
+    // 移动只是附带：元素不在就先补上，光标因此不会因为某次移动“提前清理”而消失。
+    return ensureCursor(params.tabId, params.payload === undefined ? {} : params.payload)
   },
   async 'page.metrics'(params) {
     return runInPage(params.tabId, fnMetrics)

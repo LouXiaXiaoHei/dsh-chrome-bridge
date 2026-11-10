@@ -164,9 +164,43 @@ export function apply(ctx, config) {
 
   const disconnected = async () => new Error((await diagnose()).message)
 
+  /**
+   * 光标表示“这个标签页正在被接管”，所以它的生命周期跟接管一样长：
+   * 选定的那一刻出现在页面上，中间只移动、不消失，换成别的标签页才让位。
+   * 注入和 CDP 接上都是尽力而为——光标只是可见性，不该让工具调用失败。
+   */
+  const engagedTabs = new Set()
+
+  const engage = async (tabId) => {
+    if (engagedTabs.has(tabId) || !bridge.connected) return
+    // 先记账再发请求：同一轮里的重复调用只打一次，失败后撤销，下次再补。
+    engagedTabs.add(tabId)
+    try {
+      await bridge.call('page.engage', { tabId }, { timeoutMs: 8000 })
+    } catch {
+      engagedTabs.delete(tabId)
+    }
+  }
+
+  const release = async (tabId) => {
+    if (!engagedTabs.delete(tabId)) return
+    try {
+      await bridge.call('page.release', { tabId }, { timeoutMs: 8000 })
+    } catch {
+      // 标签页已经关掉之类的，没有光标可撤。
+    }
+  }
+
+  /** 接管权转移：页面上只保留当前这个标签页的光标。 */
+  const handOff = (tabId) => {
+    for (const other of [...engagedTabs]) if (other !== tabId) void release(other)
+    void engage(tabId)
+  }
+
   const remember = async (tabId) => {
     if (typeof tabId !== 'number' || !Number.isFinite(tabId)) return undefined
     currentTabId = tabId
+    handOff(tabId)
     if (bridge.connected) {
       try {
         const result = await bridge.call('tabs.get', { tabId }, { timeoutMs: 8000 })
@@ -189,6 +223,8 @@ export function apply(ctx, config) {
   const resolveTab = async (requested) => {
     const tabId = typeof requested === 'number' && Number.isFinite(requested) ? requested : await requireTab()
     if (tabId !== currentTabId) await remember(tabId)
+    // 兜底：选定那会儿可能还没连上扩展，或者页面当时还没加载完。
+    else void engage(tabId)
     return tabId
   }
 
@@ -351,12 +387,15 @@ export function apply(ctx, config) {
 
   const cdp = (tabId, calls) => call('page.cdp', { tabId, calls })
 
-  /** Move the in-page pointer; decoration only, so a failure here is not fatal. */
+  /**
+   * 把页面里的指针挪到 (x, y)。元素不在就先补上——接管期间光标一直是同一只，
+   * 这里只负责移动，不负责决定它存不存在。
+   */
   const cursor = async (tabId, payload) => {
     try {
       await call('page.cursor', { tabId, payload })
     } catch {
-      // The page may forbid script injection (chrome:// pages); the click still works.
+      // 页面禁止注入（chrome:// 之类）时没有光标，操作本身照样能完成。
     }
   }
 
@@ -414,6 +453,16 @@ export function apply(ctx, config) {
       { ...mouseEvent('mousePressed', x, y, { button: 'left', buttons: 1, clickCount: 1 }), wait: settle },
       mouseEvent('mouseReleased', x, y, { button: 'left', buttons: 0, clickCount: 1 }),
     ])
+    await cursor(tabId, { x, y, pulse: true })
+  }
+
+  /**
+   * 原生通道走的是系统事件，页面里的指针不会自己跟过去。先把它摆到落点，
+   * 用户看到的才始终是同一只指针在操作，而不是"指针没动、页面自己变了"。
+   */
+  const alignCursor = async (tabId, x, y) => {
+    const travel = await moveCursor(tabId, x, y)
+    if (travel > 0) await sleep(travel)
     await cursor(tabId, { x, y, pulse: true })
   }
 
@@ -927,6 +976,8 @@ export function apply(ctx, config) {
             const driver = await requireDriver()
             const live = await focusableTab(tabId)
             const point = await screenPoint(driver, live, target.x, target.y)
+            // 先把页面里那只指针摆到位，再让系统去点，两者落在同一个地方。
+            await alignCursor(tabId, target.x, target.y)
             const result = await driver.call('clickAt', { x: point.x, y: point.y, title: live.title })
             return { element: result.element, how: result.how }
           },
@@ -1169,6 +1220,8 @@ export function apply(ctx, config) {
             const driver = await requireDriver()
             const live = await focusableTab(tabId)
             const point = await screenPoint(driver, live, target.x, target.y)
+            // 原生通道不动页面里的指针，先把光标摆到字段上，再让系统敲键盘。
+            await alignCursor(tabId, target.x, target.y)
             await driver.call('typeAt', {
               x: point.x, y: point.y, text: value, replace, title: live.title,
             })

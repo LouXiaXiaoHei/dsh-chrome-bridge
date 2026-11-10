@@ -1,6 +1,6 @@
 {
   "name": "dsh-chrome-tab",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "Mention a live Chrome tab with @ and let the agent read and drive it.",
