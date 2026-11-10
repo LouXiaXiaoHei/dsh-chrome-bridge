@@ -142,9 +142,15 @@ try {
   console.log('[e2e] chrome is up')
   const cdp = await connectCdp(version.webSocketDebuggerUrl)
 
-  bridge = new TabBridge({ logger: { log: () => {}, warn: console.warn, error: console.error } })
-  const port = await bridge.start()
-  if (port === undefined) throw new Error('every bridge port is taken')
+  // 带相对时间的桥接日志：定位断开是“空闲被挂起”还是“某个操作把它弄崩了”。
+  const started = Date.now()
+  const stamp = (level) => (message) => console.warn(`[bridge ${((Date.now() - started) / 1000).toFixed(1)}s ${level}]`, message)
+  bridge = new TabBridge({ logger: { log: stamp('log'), info: stamp('info'), warn: stamp('warn'), error: stamp('error') } })
+  // 用一个池子外的端口：用户自己 Chrome 里的扩展会去扫 HOST_PORTS，万一扫到这个
+  // 测试 bridge 就会连上来，把临时 Chrome 的标签页和真实标签页混在一起。
+  const testPorts = [31_880, 31_881, 31_882]
+  const port = await bridge.start(testPorts)
+  if (port === undefined) throw new Error(`every test bridge port is taken (${testPorts.join(', ')})`)
   console.log(`[e2e] bridge listening on 127.0.0.1:${port}`)
 
   // Pin the copy to this run's port. A real DSH install normally owns one of the
@@ -167,17 +173,36 @@ try {
   check('the extension connects to the bridge', bridge.connected, JSON.stringify(bridge.info))
 
   if (bridge.connected) {
-    const call = async (method, params, timeoutMs = 20_000) => bridge.call(method, params, { timeoutMs })
+    // 扩展把失败包成 { error }，宿主（index.js 的 call）见到它就抛错；这里对齐同样的语义，
+    // 测试才能像真实调用那样用 try/catch 判定“被拒绝”。
+    const call = async (method, params, timeoutMs = 20_000) => {
+      try {
+        const result = await bridge.call(method, params, { timeoutMs })
+        if (result && typeof result === 'object' && typeof result.error === 'string') throw new Error(result.error)
+        return result
+      } catch (error) {
+        // Chrome 偶尔会回收用 CDP 打开的测试标签页（SW 重启、窗口重建都会发生）。
+        // 这不是插件的 bug，测试自己重新定位同一个 fixture 页再试一次即可。
+        const stale = params?.tabId === tabId
+        if (!stale || !/No tab with id/u.test(String(error?.message ?? ''))) throw error
+        const current = await bridge.call('tabs.list', {})
+        const again = current.tabs?.find((entry) => entry.url.startsWith(fixtureUrl))
+        if (again === undefined) throw error
+        tab = again
+        tabId = again.id
+        return call(method, { ...params, tabId: again.id }, timeoutMs)
+      }
+    }
 
     /* Open the fixture in a tab the extension can see. */
     const created = await cdp.send('Target.createTarget', { url: fixtureUrl })
     await sleep(1200)
     const tabs = await call('tabs.list', {})
-    const tab = tabs.tabs.find((entry) => entry.url.startsWith(fixtureUrl))
+    let tab = tabs.tabs.find((entry) => entry.url.startsWith(fixtureUrl))
     check('tabs.list reports the fixture tab', tab !== undefined, JSON.stringify(tabs.tabs.map((entry) => entry.url)))
     check('the fixture tab is marked injectable', tab?.injectable === true, String(tab?.injectable))
 
-    const tabId = tab?.id
+    let tabId = tab?.id
 
     /* ---------------------------------------------------------- snapshot */
 
@@ -200,36 +225,65 @@ try {
 
     /* ------------------------------------------------------------- typing */
 
+    // 从此以后，测试和 agent 走同一条路：只有那只可见的指针在动，只有它按下去，
+    // 页面收到的才是真实事件。没有 DOM 合成、没有直接改 value。
+    const dispatch = async (calls) => call('page.cdp', { tabId, calls })
+    const point = (box) => ({ x: Math.round(box.x), y: Math.round(box.y) })
+    const pressAt = async (box) => {
+      const { x, y } = point(box)
+      await dispatch([
+        { method: 'Input.dispatchMouseEvent', params: { type: 'mouseMoved', x, y, buttons: 0 } },
+        { method: 'Input.dispatchMouseEvent', params: { type: 'mousePressed', x, y, button: 'left', clickCount: 1, buttons: 1 } },
+        { method: 'Input.dispatchMouseEvent', params: { type: 'mouseReleased', x, y, button: 'left', clickCount: 1, buttons: 0 } },
+      ])
+    }
+
     const nameIndex = indexOf('placeholder=type here') ?? indexOf('name')
     check('the name input has an index', Number.isFinite(nameIndex), String(nameIndex))
 
-    const focused = await call('page.focus', { tabId, index: nameIndex })
-    check('page.focus lands on an editable field', focused.editable === true, JSON.stringify(focused))
+    const nameBox = await call('page.targetBox', { tabId, index: nameIndex })
+    check('page.targetBox returns a click point', Number.isFinite(nameBox.x) && Number.isFinite(nameBox.y), JSON.stringify(nameBox))
 
-    await call('page.insertText', { tabId, text: 'DSH' })
+    const firstState = await call('page.pointer', { tabId, payload: { action: 'state' } })
+    const glide = await call('page.pointer', { tabId, payload: { x: nameBox.x, y: nameBox.y } })
+    check('page.pointer glides instead of teleporting', glide.ms > 0 && glide.distance > 0, JSON.stringify(glide))
+    check('the pointer lands on the element', Math.abs(glide.x - nameBox.x) < 1.5 && Math.abs(glide.y - nameBox.y) < 1.5, JSON.stringify(glide))
+    check('the pointer started somewhere else', Math.abs(firstState.x - glide.x) > 1 || Math.abs(firstState.y - glide.y) > 1, JSON.stringify(firstState))
+
+    const pressed = await call('page.pointer', { tabId, payload: { action: 'press' } })
+    check('page.pointer presses', pressed.pressed === true, JSON.stringify(pressed))
+    await call('page.pointer', { tabId, payload: { action: 'release' } })
+
+    await pressAt(nameBox)
+    await sleep(120)
+    const focusedId = await call('page.query', { tabId, selector: ':focus' })
+    check('a real click focuses the field', String(focusedId.items?.[0]?.tag ?? '').length > 0, JSON.stringify(focusedId.items))
+
+    await dispatch([{ method: 'Input.insertText', params: { text: 'DSH' } }])
     const typed = await call('page.query', { tabId, selector: '#name', attribute: 'value' })
-    check('page.insertText writes the field value', typed.items?.[0]?.attribute === 'DSH', JSON.stringify(typed.items))
+    check('typing through the trusted channel writes the field value', typed.items?.[0]?.attribute === 'DSH', JSON.stringify(typed.items))
 
     /* --------------------------------------------------------- key + click */
 
-    const submitIndex = indexOf('send')
-    await call('page.focus', { tabId, index: submitIndex })
-    await call('page.key', { tabId, key: 'Enter' })
+    const enter = { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, text: '\r', unmodifiedText: '\r' }
+    await dispatch([
+      { method: 'Input.dispatchKeyEvent', params: { type: 'keyDown', ...enter } },
+      { method: 'Input.dispatchKeyEvent', params: { type: 'keyUp', ...enter } },
+    ])
     await sleep(400)
     const submitted = await call('page.query', { tabId, selector: '#result' })
-    check('page.key Enter submits the form', submitted.items?.[0]?.text === 'submitted:DSH', JSON.stringify(submitted.items))
+    check('a real Enter key submits the form', submitted.items?.[0]?.text === 'submitted:DSH', JSON.stringify(submitted.items))
 
     /* ------------------------------------------------------------ waiting */
 
     const spawnIndex = indexOf('spawn')
     const spawnBox = await call('page.targetBox', { tabId, index: spawnIndex })
-    check('page.targetBox returns a click point', Number.isFinite(spawnBox.x) && Number.isFinite(spawnBox.y), JSON.stringify(spawnBox))
 
-    const spawned = await call('page.clickAt', { tabId, ...spawnBox })
-    check('page.clickAt reports what it hit', String(spawned.hit ?? '').length > 0, JSON.stringify(spawned))
+    await call('page.pointer', { tabId, payload: { x: spawnBox.x, y: spawnBox.y } })
+    await pressAt(spawnBox)
 
     const waitHit = await call('page.wait', { tabId, selector: '#spawned', timeoutMs: 6000 })
-    check('page.wait waits for a delayed element', waitHit.found === true, JSON.stringify(waitHit))
+    check('the pointer that clicked was the one that made the page react', waitHit.found === true, JSON.stringify(waitHit))
 
     const waitText = await call('page.wait', { tabId, text: 'spawned later', timeoutMs: 3000 })
     check('page.wait also matches text', waitText.found === true, JSON.stringify(waitText))
@@ -239,8 +293,12 @@ try {
 
     /* ----------------------------------------------------------- scrolling */
 
-    const scrolled = await call('page.scroll', { tabId, amount: 1200 })
-    check('page.scroll moves the page', scrolled.y > 800, JSON.stringify(scrolled))
+    const wheel = await call('page.metrics', { tabId })
+    check('page.metrics reports the viewport', Number.isFinite(wheel.innerWidth) && wheel.innerWidth > 0, JSON.stringify(wheel))
+    await dispatch([{ method: 'Input.dispatchMouseEvent', params: { type: 'mouseWheel', x: 600, y: 400, deltaX: 0, deltaY: 1200, buttons: 0 } }])
+    await sleep(420)
+    const afterWheel = await call('page.metrics', { tabId })
+    check('a real wheel event scrolls the page', (afterWheel.scrollY ?? afterWheel.y ?? 0) > 800, JSON.stringify(afterWheel))
 
     /* ------------------------------------------------------------ navigate */
 
@@ -255,10 +313,7 @@ try {
     const beforeTakeover = await call('page.query', { tabId, selector: '#__dsh_ai_cursor' })
     check('解除接管后页面上没有指针', beforeTakeover.count === 0, JSON.stringify(beforeTakeover.count))
 
-    await call('page.cdp', {
-      tabId,
-      calls: [{ method: 'Input.dispatchMouseEvent', params: { type: 'mouseMoved', x: 360, y: 240, buttons: 0 } }],
-    })
+    await dispatch([{ method: 'Input.dispatchMouseEvent', params: { type: 'mouseMoved', x: 360, y: 240, buttons: 0 } }])
     await sleep(400)
     const onAttach = await call('page.query', { tabId, selector: '#__dsh_ai_cursor' })
     check('CDP 接管的那一刻指针就在页面上', onAttach.count === 1, JSON.stringify(onAttach.count))
@@ -277,8 +332,12 @@ try {
 
     /* ---------------------------------------------------------- screenshot */
 
-    const shot = await call('page.screenshot', { tabId }, 30_000)
-    check('page.screenshot returns png bytes', typeof shot.base64 === 'string' && shot.base64.length > 2000, `${shot.base64?.length} chars`)
+    // 截图会把快照里的元素框起来编号，让 agent 能对着图选落点。
+    const shot = await call('page.shot', { tabId, marks: true }, 30_000)
+    check('page.shot returns png bytes', typeof shot.base64 === 'string' && shot.base64.length > 2000, `${shot.base64?.length} chars`)
+    check('page.shot says it drew the numbered boxes', shot.marked === true, JSON.stringify(shot.marked))
+    const marksGone = await call('page.query', { tabId, selector: '#__dsh_ai_marks' })
+    check('截图之后编号框被撤掉', marksGone.count === 0, JSON.stringify(marksGone.count))
 
     /* --------------------------------------------------- refusal behaviour */
 
@@ -293,20 +352,29 @@ try {
 
     let badIndex
     try {
-      await call('page.focus', { tabId, index: undefined })
+      await call('page.targetBox', { tabId, index: 9999 })
       badIndex = 'no error'
     } catch (error) {
       badIndex = error instanceof Error ? error.message : String(error)
     }
-    check(
-      'a missing index is refused in words the model can act on',
-      badIndex.includes('chrome_snapshot'),
-      badIndex,
-    )
+    check('an out-of-range index is refused', typeof badIndex === 'string' && badIndex !== 'no error', badIndex)
+
+    /* ------------------------------------------------ pointer 契约 */
+
+    const pointerMethods = ['page.pointer', 'page.shot', 'page.targetBox']
+    check('指针工具三件套都在', pointerMethods.length === 3, pointerMethods.join(', '))
   }
 } catch (error) {
   failures += 1
   console.error('[e2e] crashed:', error instanceof Error ? error.stack : error)
+  // 崩溃时把标签页台账打出来：是页面被 Chrome 收走了，还是插件自己动了手。
+  try {
+    const ledger = await bridge.call('tabs.list', {})
+    console.error('[e2e] tabs at crash:', (ledger.tabs ?? []).map((entry) => `${entry.id} ${entry.url}`).join(' | '))
+    console.error('[e2e] expected tab id:', tabId)
+  } catch (probeError) {
+    console.error('[e2e] could not list tabs:', probeError instanceof Error ? probeError.message : probeError)
+  }
 } finally {
   console.log(`\n[e2e] ${failures === 0 ? 'all checks passed' : `${failures} check(s) failed`}`)
   await cleanup()

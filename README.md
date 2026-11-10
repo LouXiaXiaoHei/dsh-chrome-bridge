@@ -92,7 +92,8 @@ chrome_scroll { name: "页脚" }
 | `chrome_tabs` | 列出可操作的标签页，拿 `tabId` |
 | `chrome_snapshot` | 页面快照：标题、URL、标题层级、编号的可交互元素、正文、滚动位置 |
 | `chrome_click` | 点击。给 `index`（快照编号）或 `name` |
-| `chrome_click_at` | 按视口坐标点击 |
+| `chrome_move` | 只移动指针到 `index` 或 `x`+`y`，不点击；用来先悬停、看提示、或让过程可见 |
+| `chrome_click_at` | 按视口坐标 `x`+`y` 点击，也可以直接给快照编号 `index` |
 | `chrome_type` | 输入文字。给 `index` 或 `name`；`replace` 先清空，`pressEnter` 提交 |
 | `chrome_press` | 按键：Enter、Escape、Tab、方向键、Home/End/PageUp/PageDown、字母与数字，可带 `cmd` / `shift` / `alt` / `ctrl` |
 | `chrome_drag` | 拖拽。起点 `name` / `index` / `fromX`+`fromY`，终点 `toName` / `toX`+`toY` / `dx`+`dy` |
@@ -100,7 +101,7 @@ chrome_scroll { name: "页脚" }
 | `chrome_query` | CSS 选择器查询，可读表单控件的实时值 |
 | `chrome_wait` | 等选择器命中或文本出现（最多 15 秒） |
 | `chrome_open` | 用给定 URL 打开标签页 |
-| `chrome_screenshot` | 截图存到 `~/.dsh/chrome-tab-shots/`，返回路径 |
+| `chrome_screenshot` | 截图（默认在元素上叠编号框，`marks: false` 关掉），存到 `~/.dsh/chrome-tab-shots/`，同时把图片直接交给模型 |
 
 所有工具都接受可选的 `tabId`，省略时用最近一次 `@` 选中的标签页。
 
@@ -108,13 +109,14 @@ chrome_scroll { name: "页脚" }
 
 绝大多数浏览器自动化在页面里 `dispatchEvent`，事件 `isTrusted` 恒为 `false`：反爬脚本一行代码识破，滑块和拖拽干脆不响应，富文本编辑器不认。
 
-每个动作按顺序尝试三条通道，成功即停：
+每个动作按顺序尝试两条通道，成功即停：
 
 | 顺序 | 通道 | 事件由谁产生 | 前提 |
 | --- | --- | --- | --- |
 | 1 | CDP | 浏览器输入管线：`Input.dispatchMouseEvent` / `dispatchKeyEvent` / `insertText` | 扩展的 `debugger` 权限 |
 | 2 | 原生 | macOS 进程级投递：AX `AXPress`、`CGEvent.postToPid`、全局 tap | 仅 macOS + 辅助功能授权 + 编译器 |
-| 3 | 合成 | 页面内 `dispatchEvent` | 无 |
+
+页面内 `dispatchEvent` 那条合成通道已经删掉了：它绕过指针、事件 `isTrusted` 为假，等于在你眼皮底下假装操作。两条真通道都失败时工具直接报错，不会换个方式偷偷把事做完。
 
 **CDP 是主干。** 事件序列与真人一致（`pointerover → pointermove → pointerdown → mousedown(buttons=1, detail=1) → pointerup → mouseup → click`），不需要 Chrome 在前台，也不切换你的标签页，系统鼠标一动不动——按下、移动、抬起全在浏览器内部完成。
 
@@ -131,13 +133,23 @@ chrome_scroll { name: "页脚" }
 
 拖拽是唯一绕不过全局事件的：`postToPid` 投递的按下拿不到窗口内坐标，落不到网页上（试过 `CGAssociateMouseAndMouseCursorPosition(false)`，光标照样被带走）。工具会在拖拽前后隐藏光标并复位到原处。**走 CDP 没有这个问题**，这也是把 CDP 做主干的原因之一。
 
-**合成通道只是兜底**，返回值里会明写 `synthetic`，不会假装成功。
 
 > 只有当 CDP 也找不到那个名字、退回无障碍树时，才会把标签页切到前台——Chrome 只对当前标签页暴露无障碍树。
 
+## 先看，再动
+
+工具不再替模型猜页面长什么样：每一步都由「读元素 → 看图 → 动手」三件事组成。
+
+1. `chrome_snapshot` 读出页面结构，每个可交互元素带一个编号和它的视口坐标（`@x,y`，超出视口会标 `(above)` / `(below)` / `(partly offscreen)`）。
+2. `chrome_screenshot` 截图，默认在页面上把同一批元素框出来、标上同样的编号（截图完成后框会自动撤掉，不留在页面里）。图片直接作为图像交给模型，同时也存一份到 `~/.dsh/chrome-tab-shots/`。
+3. 动手：`chrome_click` / `chrome_type` 用编号或名字，`chrome_move` / `chrome_click_at` / `chrome_drag` 用坐标。图上量到的点和快照里读到的坐标是同一套坐标系（视口 CSS 像素）。
+
+编号框用的是红框 + 左上角数字，和 `chrome_snapshot` 里的编号一一对应，所以「图上的 7」就是「快照里的 7」。
 ## 页面上那只指针
 
-接管一个标签页的那一刻，指针就出现在页面上：落在视口中心，涟漪一次。之后整段接管期它都在——滑到目标、按下（压暗 + 涟漪）、松手，停在该处轻轻浮动。导航到新页面、页面框架把 DOM 整个换掉，它都会被放回原处；只有接管转移给别的标签页，或者调试通道断开时，它才离开。
+接管一个标签页的那一刻，指针就出现在页面上：落在视口中心，涟漪一次。之后整段接管期它都在——滑到目标、按下（压暗 + 涟漪）、松手，停在该处。导航到新页面、页面框架把 DOM 整个换掉，它都会被放回原处；只有接管转移给别的标签页，或者调试通道断开时，它才离开。
+
+**它是唯一的手。** 点击、输入、按键、拖拽、滚动都不再绕开它：每个动作先把指针滑到目标点，按下，再由 CDP 在同一坐标上发事件，然后松手。滑动是页面里的逐帧动画（`requestAnimationFrame` + ease-in-out），不是 CSS transition，所以宿主知道它什么时候真正落点，工具会等落点后再按键——你看到的箭头位置就是事件发生的位置。
 
 它表示的是"这个标签页正在被操作"这个状态，不是某次工具调用临时画上去的装饰。
 

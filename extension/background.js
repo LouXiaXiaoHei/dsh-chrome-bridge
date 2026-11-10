@@ -109,12 +109,38 @@ function fnSnapshot(options) {
     if (label) headings.push(headingNodes[i].tagName.toLowerCase() + ': ' + label)
   }
 
+  // 每个元素带上视口中心坐标：编号说明是哪几个，坐标说明点哪儿，agent 因此
+  // 可以只凭截图和这份清单去驱动鼠标，而不必猜元素名。
+  const boxes = []
+  const lines = []
+  for (let i = 0; i < elements.length; i += 1) {
+    const element = elements[i]
+    const rect = element.getBoundingClientRect()
+    const cx = Math.round(rect.left + rect.width / 2)
+    const cy = Math.round(rect.top + rect.height / 2)
+    boxes.push({
+      n: i + 1,
+      x: cx,
+      y: cy,
+      left: Math.round(rect.left),
+      top: Math.round(rect.top),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+    })
+    let line = (i + 1) + '. ' + describe(element) + ' @' + cx + ',' + cy
+    if (rect.bottom < 0) line += ' (above)'
+    else if (rect.top > window.innerHeight) line += ' (below)'
+    else if (rect.bottom > window.innerHeight || rect.left < 0) line += ' (partly offscreen)'
+    lines.push(line)
+  }
+
   return {
     url: location.href,
     title: document.title,
     readyState: document.readyState,
     headings,
-    interactive: elements.map((element, offset) => (offset + 1) + '. ' + describe(element)),
+    interactive: lines,
+    boxes,
     interactiveTruncated: truncated,
     text: compact(document.body ? document.body.innerText : document.documentElement.textContent, maxText),
     scroll: {
@@ -127,9 +153,11 @@ function fnSnapshot(options) {
 
 function fnTargetBox(index) {
   const store = globalThis.__dshChromeTab
+  // 页面里抛出的异常到了宿主那边会变成 result: undefined（Chrome 不给 InjectionResult.error），
+  // 所以错误一律以对象形式返回，由宿主方法判定后再抛。
   if (!store || !store.elements) return { error: 'no snapshot on record; call chrome_snapshot first' }
   const element = store.elements[index - 1]
-  if (!element) return { error: 'index ' + index + ' is not in the current snapshot' }
+  if (!element) return { error: 'index ' + index + ' is not in the current snapshot (1-' + store.elements.length + ')' }
   element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' })
   const rect = element.getBoundingClientRect()
   if (rect.width < 1 || rect.height < 1) return { error: 'index ' + index + ' has no clickable box' }
@@ -148,97 +176,6 @@ function fnTargetBox(index) {
     tag: element.tagName.toLowerCase(),
     label,
     editable,
-  }
-}
-
-function fnClickAt(point) {
-  const x = Number(point.x)
-  const y = Number(point.y)
-  const element = document.elementFromPoint(x, y)
-  if (!element) return { error: 'nothing at ' + x + ',' + y }
-  const init = { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y, view: window, button: 0 }
-  const pointer = Object.assign({}, init, { pointerId: 1, pointerType: 'mouse', isPrimary: true })
-  element.dispatchEvent(new PointerEvent('pointerdown', pointer))
-  element.dispatchEvent(new MouseEvent('mousedown', init))
-  if (typeof element.focus === 'function') element.focus({ preventScroll: true })
-  element.dispatchEvent(new PointerEvent('pointerup', pointer))
-  element.dispatchEvent(new MouseEvent('mouseup', init))
-  element.dispatchEvent(new MouseEvent('click', init))
-  const label = String(element.getAttribute('aria-label') || element.innerText || element.textContent || '')
-    .replace(/\s+/gu, ' ')
-    .trim()
-    .slice(0, 80)
-  const tag = element.tagName.toLowerCase()
-  return { tag, label, hit: label ? tag + ' ' + JSON.stringify(label) : tag }
-}
-
-function fnFocus(index) {
-  const store = globalThis.__dshChromeTab
-  if (!store || !store.elements) return { error: 'no snapshot on record; call chrome_snapshot first' }
-  const element = store.elements[index - 1]
-  if (!element) return { error: 'index ' + index + ' is not in the current snapshot' }
-  element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' })
-  if (typeof element.focus === 'function') element.focus({ preventScroll: true })
-  const editable = element instanceof HTMLInputElement
-    || element instanceof HTMLTextAreaElement
-    || element.isContentEditable === true
-  return {
-    tag: element.tagName.toLowerCase(),
-    editable,
-    label: String(element.getAttribute('aria-label') || element.getAttribute('placeholder') || '').slice(0, 80),
-  }
-}
-
-function fnInsertText(payload) {
-  const text = String(payload.text == null ? '' : payload.text)
-  const element = document.activeElement
-  if (!element || element === document.body) return { error: 'no focused element; click the field first' }
-  if (payload.replace === true) {
-    if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) element.select()
-    else if (element.isContentEditable) document.execCommand('selectAll', false)
-  }
-  if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
-    const prototype = element instanceof HTMLInputElement
-      ? HTMLInputElement.prototype
-      : HTMLTextAreaElement.prototype
-    const setter = Object.getOwnPropertyDescriptor(prototype, 'value').set
-    const next = payload.replace === true ? text : element.value + text
-    setter.call(element, next)
-    element.dispatchEvent(new Event('input', { bubbles: true, composed: true }))
-    element.dispatchEvent(new Event('change', { bubbles: true }))
-    return { tag: element.tagName.toLowerCase(), value: element.value.slice(0, 200) }
-  }
-  if (element.isContentEditable) {
-    document.execCommand('insertText', false, text)
-    return { tag: element.tagName.toLowerCase(), value: String(element.innerText || '').slice(0, 200) }
-  }
-  return { error: 'the focused element accepts no text' }
-}
-
-function fnKey(payload) {
-  const element = document.activeElement || document.body
-  const key = String(payload.key)
-  const base = { key, bubbles: true, cancelable: true, composed: true, view: window }
-  if (key === 'Enter') Object.assign(base, { code: 'Enter', keyCode: 13, which: 13 })
-  if (key === 'Escape') Object.assign(base, { code: 'Escape', keyCode: 27, which: 27 })
-  if (key === 'Tab') Object.assign(base, { code: 'Tab', keyCode: 9, which: 9 })
-  element.dispatchEvent(new KeyboardEvent('keydown', base))
-  element.dispatchEvent(new KeyboardEvent('keypress', base))
-  element.dispatchEvent(new KeyboardEvent('keyup', base))
-  if (key === 'Enter' && element.form && typeof element.form.requestSubmit === 'function') {
-    // A synthetic Enter rarely submits on its own; help form fields along.
-    element.form.requestSubmit()
-  }
-  return { tag: element.tagName.toLowerCase(), key }
-}
-
-function fnScroll(payload) {
-  const amount = Number(payload.amount) || 600
-  window.scrollBy({ top: amount, left: 0, behavior: 'instant' })
-  return {
-    y: Math.round(window.scrollY),
-    height: Math.round(document.documentElement.scrollHeight),
-    viewport: window.innerHeight,
   }
 }
 
@@ -302,13 +239,18 @@ function fnWaitProbe(payload) {
  * other, so the host reads the viewport size here and divides it into the web
  * area's real size, which Chrome already reports in screen points.
  */
-// The pointer the user sees while the agent works. It lives inside the page, so it
-// can never float over another application — and because it is only decoration it
-// opts out of hit testing entirely.
-//
-// 光标代表“这个标签页正在被接管”，所以它的生命周期跟接管一样长：接管开始时创建，
-// 中途只移动、不消失，解除接管时才移除。每次调用都先补齐元素，移动只是附带动作。
+// 指针是这台插件唯一的手：页面上那只箭头就是执行输入的那只手。它只做装饰
+// （pointer-events:none），位置记在 dataset 上，移动由 fnPointer 逐帧推动——
+// CSS transition 只有视觉效果，宿主无法知道它什么时候真正落点，逐帧动画可以。
 function fnCursor(payload) {
+  // 涟漪逻辑必须内联：这个函数是整段序列化后注入页面的，模块作用域里的东西全都不在。
+  const ripple = (target) => {
+    const ring = target.querySelector('.__ring')
+    if (!ring) return
+    ring.style.animation = 'none'
+    void ring.offsetWidth
+    ring.style.animation = '__dsh_ai_ring 460ms ease-out'
+  }
   const ID = '__dsh_ai_cursor'
   const STYLE_ID = '__dsh_ai_cursor_style'
   const p = payload || {}
@@ -317,6 +259,8 @@ function fnCursor(payload) {
     if (existing) existing.remove()
     const style = document.getElementById(STYLE_ID)
     if (style) style.remove()
+    const marks = document.getElementById('__dsh_ai_marks')
+    if (marks) marks.remove()
     const guard = window.__dshAiCursorGuard
     if (guard !== undefined) {
       guard.disconnect()
@@ -329,43 +273,39 @@ function fnCursor(payload) {
     const style = document.createElement('style')
     style.id = STYLE_ID
     style.textContent = [
-      '@keyframes __dsh_ai_bob{0%,100%{transform:translate3d(0,0,0)}50%{transform:translate3d(0,-1.4px,0)}}',
-      '@keyframes __dsh_ai_ring{0%{opacity:.85;transform:scale(.25)}70%{opacity:.28}100%{opacity:0;transform:scale(1.55)}}',
-      `#${ID}{position:fixed;left:0;top:0;z-index:2147483647;pointer-events:none;width:0;height:0;`,
-      'transition:transform 200ms cubic-bezier(.22,.9,.28,1);will-change:transform}',
-      `#${ID} .__bob{width:19px;height:25px;transform-origin:2px 2px;`,
-      'animation:__dsh_ai_bob 3s ease-in-out infinite;transition:transform 90ms ease-out;',
-      'filter:drop-shadow(0 0 1.6px rgba(255,255,255,.95)) drop-shadow(0 1px 2.5px rgba(0,0,0,.45))}',
-      `#${ID}.__press .__bob{transform:scale(.86)}`,
-      `#${ID} .__ring{position:absolute;left:0;top:0;width:30px;height:30px;margin:-15px 0 0 -15px;`,
+      '@keyframes __dsh_ai_ring{0%{opacity:.92;transform:scale(.2)}70%{opacity:.32}100%{opacity:0;transform:scale(1.75)}}',
+      '#' + ID + '{position:fixed;left:0;top:0;z-index:2147483647;pointer-events:none;width:0;height:0;',
+      'will-change:transform;contain:layout style}',
+      '#' + ID + ' .__arrow{width:20px;height:26px;transform-origin:2px 2px;transition:transform 90ms ease-out;',
+      'filter:drop-shadow(0 0 1.8px rgba(255,255,255,.98)) drop-shadow(0 1px 3px rgba(0,0,0,.5))}',
+      '#' + ID + '.__press .__arrow{transform:scale(.8);transition-duration:40ms}',
+      '#' + ID + ' .__ring{position:absolute;left:0;top:0;width:32px;height:32px;margin:-16px 0 0 -16px;',
       'border-radius:50%;border:2.5px solid rgba(255,255,255,.95);opacity:0;pointer-events:none;',
-      'box-shadow:0 0 0 1px rgba(0,0,0,.22) inset,0 0 6px rgba(255,255,255,.65)}',
+      'box-shadow:0 0 0 1px rgba(0,0,0,.22) inset,0 0 8px rgba(255,255,255,.7)}',
     ].join('')
     ;(document.head || document.documentElement).appendChild(style)
   }
 
-  let root = existing
   const askedX = Number(p.x)
   const askedY = Number(p.y)
   const hasPoint = Number.isFinite(askedX) && Number.isFinite(askedY)
-  // 接管那一刻还没有任何操作，没人给出坐标，就落在视口中心——最不突兀的起点。
-  const x = hasPoint ? askedX : Math.round(window.innerWidth / 2)
-  const y = hasPoint ? askedY : Math.round(window.innerHeight / 2)
+  let root = existing
   if (!root) {
+    // 接管那一刻还没有任何操作，没人给出坐标，就落在视口中心——最不突兀的起点。
+    const x = hasPoint ? askedX : Math.round(window.innerWidth / 2)
+    const y = hasPoint ? askedY : Math.round(window.innerHeight / 2)
     root = document.createElement('div')
     root.id = ID
     root.setAttribute('aria-hidden', 'true')
-    root.style.transition = 'none'
-    root.style.transform = `translate3d(${x - 1.6}px, ${y - 1.2}px, 0)`
-    root.innerHTML =
-      '<div class="__bob"><svg width="19" height="25" viewBox="0 0 19 25">' +
-      '<path d="M1.7 1.3 L1.7 20.2 L6.8 15.5 L10.1 23.1 L13.3 21.7 L10 14.1 L16.7 13.8 Z" ' +
-      'fill="#111111" stroke="#ffffff" stroke-width="1.7" stroke-linejoin="round"/>' +
-      '</svg></div><span class="__ring"></span>'
+    root.dataset.px = String(x)
+    root.dataset.py = String(y)
+    root.style.transform = 'translate3d(' + (x - 1.6) + 'px,' + (y - 1.2) + 'px,0)'
+    root.innerHTML = '<div class="__arrow"><svg width="20" height="26" viewBox="0 0 20 26">'
+      + '<path d="M2.2 1.4 L2.2 21.4 L7.4 16.4 L10.9 24.4 L14.3 22.9 L10.9 15 L17.6 14.6 Z" '
+      + 'fill="#111111" stroke="#ffffff" stroke-width="1.9" stroke-linejoin="round"/></svg></div>'
+      + '<span class="__ring"></span>'
     // 挂在 html 上而不是 body：单页应用首屏水合时经常整个替换 body，光标会跟着没。
     ;(document.documentElement || document.body).appendChild(root)
-    void root.offsetWidth
-    root.style.transition = ''
     // 仍然可能有框架重排 html 的子节点，守望一次，把被挤掉的光标放回原处，
     // 这样“接管期间光标一直在”不依赖任何操作的时机。
     if (window.__dshAiCursorGuard === undefined) {
@@ -377,23 +317,167 @@ function fnCursor(payload) {
       guard.observe(document.documentElement, { childList: true })
       window.__dshAiCursorGuard = guard
     }
-  } else if (hasPoint) {
-    root.style.transform = `translate3d(${x - 1.6}px, ${y - 1.2}px, 0)`
+  } else if (hasPoint && root.dataset.anim !== '1') {
+    // 一次明确的落点：动画没在跑就直接摆过去，跑了就让动画自己收尾。
+    root.dataset.px = String(askedX)
+    root.dataset.py = String(askedY)
+    root.style.transform = 'translate3d(' + (askedX - 1.6) + 'px,' + (askedY - 1.2) + 'px,0)'
   }
 
   if (p.pressed === true) root.classList.add('__press')
-  else root.classList.remove('__press')
+  else if (p.pressed === false) root.classList.remove('__press')
+  if (p.pulse === true) ripple(root)
+  return { ok: true, created: existing === null, x: Number(root.dataset.px), y: Number(root.dataset.py) }
+}
 
-  if (p.pulse === true) {
-    const ring = root.querySelector('.__ring')
-    if (ring) {
-      ring.style.animation = 'none'
-      void ring.offsetWidth
-      ring.style.animation = '__dsh_ai_ring 420ms ease-out'
+// 指针在这里真正移动：逐帧插值，宿主可以等它落点，也可以被下一次移动打断。
+// 返回这次移动的起止点、距离和实际耗时，宿主据此等待，输入才会落在指针上。
+async function fnPointer(options) {
+  // 涟漪逻辑必须内联：这个函数是整段序列化后注入页面的，模块作用域里的东西全都不在。
+  const ripple = (target) => {
+    const ring = target.querySelector('.__ring')
+    if (!ring) return
+    ring.style.animation = 'none'
+    void ring.offsetWidth
+    ring.style.animation = '__dsh_ai_ring 460ms ease-out'
+  }
+  const ID = '__dsh_ai_cursor'
+  const o = options || {}
+  const action = String(o.action || 'glide')
+  const el = document.getElementById(ID)
+  if (!el) return { present: false, action }
+  if (action === 'state') {
+    return {
+      present: true,
+      x: Number(el.dataset.px),
+      y: Number(el.dataset.py),
+      pressed: el.classList.contains('__press'),
+      viewport: { width: window.innerWidth, height: window.innerHeight },
     }
   }
-  // created 为真表示这一次调用才把光标放上去，调用方可以据此判断接管是否刚刚成立。
-  return { ok: true, created: existing === null, x, y }
+  if (action === 'press' || action === 'release') {
+    if (action === 'press') el.classList.add('__press')
+    else el.classList.remove('__press')
+    ripple(el)
+    return { present: true, pressed: action === 'press', x: Number(el.dataset.px), y: Number(el.dataset.py) }
+  }
+  if (action === 'pulse') {
+    ripple(el)
+    return { present: true, x: Number(el.dataset.px), y: Number(el.dataset.py) }
+  }
+
+  const x = Number(o.x)
+  const y = Number(o.y)
+  if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error('pointer glide needs finite x and y')
+  const fromX = Number(el.dataset.px)
+  const fromY = Number(el.dataset.py)
+  const sx = Number.isFinite(fromX) ? fromX : x
+  const sy = Number.isFinite(fromY) ? fromY : y
+  const distance = Math.hypot(x - sx, y - sy)
+  const asked = Number(o.ms)
+  const ms = Number.isFinite(asked) && asked >= 0
+    ? Math.min(asked, 2000)
+    : Math.max(180, Math.min(620, 170 + distance * 0.45))
+  const token = (Number(el.dataset.token) || 0) + 1
+  el.dataset.token = String(token)
+  el.classList.remove('__press')
+  const place = (px, py) => {
+    el.dataset.px = px.toFixed(2)
+    el.dataset.py = py.toFixed(2)
+    el.style.transform = 'translate3d(' + (px - 1.6).toFixed(2) + 'px,' + (py - 1.2).toFixed(2) + 'px,0)'
+  }
+  const settle = (px, py) => {
+    el.dataset.px = String(px)
+    el.dataset.py = String(py)
+  }
+  const report = (used) => ({
+    present: true,
+    x,
+    y,
+    fromX: Math.round(sx),
+    fromY: Math.round(sy),
+    distance: Math.round(distance),
+    ms: Math.round(used),
+  })
+  if (distance < 0.75 || ms === 0) {
+    place(x, y)
+    settle(x, y)
+    return report(0)
+  }
+  place(sx, sy)
+  el.dataset.anim = '1'
+  await new Promise((resolve) => {
+    const started = performance.now()
+    const step = (now) => {
+      // 期间又来了新的移动：让位，别把指针往回拽。
+      if (Number(el.dataset.token) !== token || !el.isConnected) { resolve(); return }
+      const t = Math.min(1, (now - started) / ms)
+      const eased = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2
+      place(sx + (x - sx) * eased, sy + (y - sy) * eased)
+      if (t < 1) requestAnimationFrame(step)
+      else resolve()
+    }
+    requestAnimationFrame(step)
+  })
+  if (Number(el.dataset.token) === token) place(x, y)
+  settle(x, y)
+  if (Number(el.dataset.token) === token) el.dataset.anim = ''
+  return report(ms)
+}
+
+// 截图上的编号框：先选出要看的东西，再把它编号画在页面上，agent 看到的就是
+// 一张带坐标的图。只在截图那一瞬间存在，取完立刻撤掉。
+function fnMarks(options) {
+  const HOST_ID = '__dsh_ai_marks'
+  const o = options || {}
+  const existing = document.getElementById(HOST_ID)
+  if (existing) existing.remove()
+  if (o.mode === 'hide') return { ok: true, hidden: existing !== null }
+  const store = globalThis.__dshChromeTab
+  const items = Array.isArray(o.items)
+    ? o.items
+    : store && Array.isArray(store.elements)
+      ? store.elements.map((element, offset) => {
+        const rect = element.getBoundingClientRect()
+        return {
+          n: offset + 1,
+          left: rect.left,
+          top: rect.top,
+          width: rect.width,
+          height: rect.height,
+        }
+      })
+      : []
+  const host = document.createElement('div')
+  host.id = HOST_ID
+  host.setAttribute('aria-hidden', 'true')
+  host.style.cssText = 'position:fixed;left:0;top:0;width:0;height:0;z-index:2147483646;pointer-events:none'
+  let drawn = 0
+  for (let i = 0; i < items.length; i += 1) {
+    const item = items[i] || {}
+    const n = Number(item.n)
+    const left = Number(item.left)
+    const top = Number(item.top)
+    const width = Number(item.width)
+    const height = Number(item.height)
+    if (!Number.isFinite(n) || !Number.isFinite(left) || !Number.isFinite(top)) continue
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width < 2 || height < 2) continue
+    const box = document.createElement('div')
+    box.style.cssText = 'position:fixed;left:' + left.toFixed(1) + 'px;top:' + top.toFixed(1) + 'px;'
+      + 'width:' + width.toFixed(1) + 'px;height:' + height.toFixed(1) + 'px;'
+      + 'border:2px solid rgba(255,45,85,.92);border-radius:4px;background:rgba(255,45,85,.10);'
+      + 'box-sizing:border-box;pointer-events:none'
+    const tag = document.createElement('span')
+    tag.textContent = String(n)
+    tag.style.cssText = 'position:absolute;left:-2px;top:-15px;min-width:16px;padding:0 3px;border-radius:8px;'
+      + 'background:#ff2d55;color:#ffffff;font:700 10px/15px ui-monospace,SFMono-Regular,Menlo,monospace;'
+      + 'text-align:center;box-shadow:0 0 0 1.5px rgba(255,255,255,.95);box-sizing:border-box'
+    box.appendChild(tag)
+    host.appendChild(box)
+    drawn += 1
+  }
+  ;(document.documentElement || document.body).appendChild(host)
+  return { ok: true, drawn }
 }
 
 function fnMetrics() {
@@ -470,6 +554,10 @@ async function runInPage(tabId, fn, args) {
   const first = Array.isArray(results) ? results[0] : undefined
   if (!first) throw new Error('the page returned no result')
   if (first.error) throw new Error(String(first.error.message || first.error))
+  // 注入函数抛错时 Chrome 只把 result 置空、不报告原因：宁可报错，也不要静默返回 undefined。
+  if (first.result === undefined) {
+    throw new Error('the page function returned nothing; it probably threw (check the page console)')
+  }
   return first.result
 }
 
@@ -689,6 +777,39 @@ const METHODS = {
     // 移动只是附带：元素不在就先补上，光标因此不会因为某次移动“提前清理”而消失。
     return ensureCursor(params.tabId, params.payload === undefined ? {} : params.payload)
   },
+  // 指针是这台插件唯一的手：移动、按下、松开都由它来做，宿主等它真的到位
+  // 之后才注入输入，所以用户看到的箭头和页面实际发生的事是同一件事。
+  async 'page.pointer'(params) {
+    const tabId = Number(params.tabId)
+    if (!Number.isFinite(tabId)) throw new Error('page.pointer needs a numeric tabId')
+    // 导演要动指针之前，指针得先存在：先造一只（已在就什么都不做）。
+    await ensureCursor(tabId, {})
+    return runInPage(tabId, fnPointer, params.payload || {})
+  },
+  // 截图前把编号框画在页面上，截完立刻撤掉：一次调用里完成，不会留残影。
+  async 'page.shot'(params) {
+    const tabId = Number(params.tabId)
+    if (!Number.isFinite(tabId)) throw new Error('page.shot needs a numeric tabId')
+    const tab = await chrome.tabs.get(tabId)
+    await chrome.tabs.update(tabId, { active: true })
+    await chrome.windows.update(tab.windowId, { focused: true })
+    const wantMarks = params.marks === true
+    if (wantMarks) await runInPage(tabId, fnMarks, {})
+    try {
+      // 先激活再画框再等重绘：视口尺寸在激活那一刻才稳定，框才不会画错位置。
+      await new Promise((resolve) => setTimeout(resolve, 260))
+      const shot = await capture(tabId)
+      return wantMarks ? { base64: shot.base64, marked: true } : shot
+    } finally {
+      if (wantMarks) {
+        try {
+          await runInPage(tabId, fnMarks, { mode: 'hide' })
+        } catch {
+          // 页面可能已经跳走，框跟着文档一起没了。
+        }
+      }
+    }
+  },
   async 'page.metrics'(params) {
     return runInPage(params.tabId, fnMetrics)
   },
@@ -699,25 +820,9 @@ const METHODS = {
     })
   },
   async 'page.targetBox'(params) {
-    return runInPage(params.tabId, fnTargetBox, requireIndex(params.index))
-  },
-  async 'page.clickAt'(params) {
-    const x = Number(params.x)
-    const y = Number(params.y)
-    if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error('clickAt needs finite x and y viewport coordinates')
-    return runInPage(params.tabId, fnClickAt, { x, y })
-  },
-  async 'page.focus'(params) {
-    return runInPage(params.tabId, fnFocus, requireIndex(params.index))
-  },
-  async 'page.insertText'(params) {
-    return runInPage(params.tabId, fnInsertText, { text: String(params.text ?? ''), replace: params.replace === true })
-  },
-  async 'page.key'(params) {
-    return runInPage(params.tabId, fnKey, { key: params.key })
-  },
-  async 'page.scroll'(params) {
-    return runInPage(params.tabId, fnScroll, { amount: params.amount })
+    const box = await runInPage(params.tabId, fnTargetBox, requireIndex(params.index))
+    if (box && typeof box.error === 'string') throw new Error(box.error)
+    return box
   },
   async 'page.navigate'(params) {
     const url = String(params.url)
@@ -754,9 +859,6 @@ const METHODS = {
       if (Date.now() - started >= timeoutMs) return { found: false, elapsedMs: Date.now() - started, detail: last?.detail || '' }
       await new Promise((resolve) => setTimeout(resolve, 250))
     }
-  },
-  async 'page.screenshot'(params) {
-    return capture(params.tabId)
   },
 }
 

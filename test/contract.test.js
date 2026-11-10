@@ -56,7 +56,7 @@ check('the extension dials the url the host serves', typeof hostSocketPath === '
 
 // Every tool the model sees must exist in the host module.
 const toolNames = [...host.matchAll(/name: '(chrome_[a-z_]+)'/gu)].map((match) => match[1])
-check('twelve tools are advertised', toolNames.length === 12, `${toolNames.length}: ${toolNames.join(', ')}`)
+check('thirteen tools are advertised', toolNames.length === 13, `${toolNames.length}: ${toolNames.join(', ')}`)
 check('tool names are unique', new Set(toolNames).size === toolNames.length)
 check('the deprecated eval tool is gone', !toolNames.includes('chrome_eval'))
 

@@ -39,6 +39,28 @@ export const SOCKET_PATH = '/dsh-chrome-tab/bridge'
 
 const HOST = '127.0.0.1'
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+/**
+ * Calls that may be sent again after a dropped connection without changing the page.
+ *
+ * Chrome restarts an extension's service worker now and then, which drops the socket and
+ * fails whatever was in flight. Re-sending a read is free; re-sending a click is not, so
+ * anything that touches the page as a side effect stays out of this set and fails loudly.
+ */
+const RETRY_SAFE = new Set([
+  'ping',
+  'tabs.list',
+  'tabs.get',
+  'page.snapshot',
+  'page.query',
+  'page.wait',
+  'page.metrics',
+  'page.targetBox',
+  'page.shot',
+  'page.cursor',
+  // 指针动作是幂等的（滑到某点、按下、抬起），重发一次不会让页面多做一件事。
+  'page.pointer',
+])
+
 const OPCODE = { continuation: 0x0, text: 0x1, binary: 0x2, close: 0x8, ping: 0x9, pong: 0xa }
 
 /** Encode one unmasked server frame. */
@@ -222,6 +244,8 @@ export class TabBridge {
   #server
   #peer
   #pending = new Map()
+  #waiters = []
+  #heartbeat
   #port
   #info = undefined
   #logger
@@ -255,8 +279,8 @@ export class TabBridge {
   }
 
   /** Bind the first free candidate port. Resolves the bound port, or undefined. */
-  async start() {
-    for (const port of BRIDGE_PORTS) {
+  async start(ports = BRIDGE_PORTS) {
+    for (const port of ports) {
       const server = createServer((request, response) => this.#handleHttp(request, response))
       server.on('upgrade', (request, socket, head) => this.#handleUpgrade(request, socket, head))
       const bound = await new Promise((resolve) => {
@@ -284,7 +308,7 @@ export class TabBridge {
       this.#logger?.info?.(`chrome-tab: bridge listening on ${this.wsUrl}`)
       return port
     }
-    this.#logger?.warn?.(`chrome-tab: no free bridge port among ${BRIDGE_PORTS.join(', ')}`)
+    this.#logger?.warn?.(`chrome-tab: no free bridge port among ${ports.join(', ')}`)
     return undefined
   }
 
@@ -339,11 +363,17 @@ export class TabBridge {
       onClose: () => {
         if (this.#peer === peer) {
           this.#peer = undefined
-          this.#failAll(new Error('browser extension disconnected'))
+          this.#stopHeartbeat()
+          // 请求可能已经执行，只是回执没回来：不自动重发（点击重复执行更糟），交给调用方决定。
+          this.#failAll(new Error('browser extension disconnected; the MV3 service worker was probably suspended, retry the call'))
         }
       },
     })
     this.#peer = peer
+    this.#startHeartbeat()
+    const waiters = this.#waiters
+    this.#waiters = []
+    for (const wake of waiters) wake(peer)
     this.#logger?.info?.('chrome-tab: browser extension connected')
   }
 
@@ -369,19 +399,78 @@ export class TabBridge {
   }
 
   #failAll(error) {
+    const waiting = [...this.#pending.values()].map((pending) => pending.method).filter(Boolean)
+    const detail = waiting.length === 0 ? error.message : `${error.message} (while ${waiting.join(', ')} was waiting)`
+    this.#logger?.warn?.(`chrome-tab: ${detail}`)
     for (const [, pending] of this.#pending) {
       clearTimeout(pending.timer)
-      pending.reject(error)
+      pending.reject(new Error(waiting.length === 0 ? error.message : detail))
     }
     this.#pending.clear()
   }
 
+  /**
+   * Keep the MV3 service worker awake.
+   *
+   * Chrome suspends an idle service worker after about 30 seconds, which drops the socket and
+   * fails whatever the next call was. One small message every 20 seconds is an event it has to
+   * handle, so the worker stays up while the session is idle between tool calls.
+   */
+  #startHeartbeat() {
+    this.#stopHeartbeat()
+    const timer = setInterval(() => {
+      if (!this.connected) return
+      this.call('ping', {}, { timeoutMs: 15000 }).catch(() => {})
+    }, 20000)
+    if (typeof timer.unref === 'function') timer.unref()
+    this.#heartbeat = timer
+  }
+
+  #stopHeartbeat() {
+    if (this.#heartbeat !== undefined) clearInterval(this.#heartbeat)
+    this.#heartbeat = undefined
+  }
+
+  /** Wait up to `ms` for the extension to (re)connect; resolves to the peer or undefined. */
+  #awaitPeer(ms) {
+    const peer = this.#peer
+    if (peer !== undefined && !peer.closed) return Promise.resolve(peer)
+    if (ms <= 0) return Promise.resolve(undefined)
+    return new Promise((resolve) => {
+      let timer
+      const wake = (live) => {
+        clearTimeout(timer)
+        resolve(live)
+      }
+      timer = setTimeout(() => {
+        this.#waiters = this.#waiters.filter((entry) => entry !== wake)
+        resolve(undefined)
+      }, ms)
+      if (typeof timer.unref === 'function') timer.unref()
+      this.#waiters.push(wake)
+    })
+  }
+
   /** One request/response round trip to the extension. */
   call(method, params = {}, { timeoutMs = 60000 } = {}) {
-    const peer = this.#peer
-    if (peer === undefined || peer.closed) {
-      return Promise.reject(new Error('browser extension is not connected'))
+    // MV3 把 service worker 挂起再唤醒的瞬间，socket 会短暂缺席；只读的调用再等一次、再发一次，
+    // 用户就看不到这次抖动。有副作用的调用不重发：宁可报错，也不要把点击做两遍。
+    return this.#callWithRetry(method, params, timeoutMs, RETRY_SAFE.has(method) ? 1 : 0)
+  }
+
+  async #callWithRetry(method, params, timeoutMs, attemptsLeft) {
+    const peer = await this.#awaitPeer(Math.min(3000, timeoutMs))
+    if (peer === undefined) throw new Error('browser extension is not connected')
+    try {
+      return await this.#roundTrip(peer, method, params, timeoutMs)
+    } catch (error) {
+      const transient = /disconnected|reconnected|not connected/iu.test(String(error?.message ?? ''))
+      if (attemptsLeft <= 0 || !transient) throw error
+      return this.#callWithRetry(method, params, timeoutMs, attemptsLeft - 1)
     }
+  }
+
+  #roundTrip(peer, method, params, timeoutMs) {
     const id = randomUUID()
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -389,7 +478,7 @@ export class TabBridge {
         reject(new Error(`browser extension did not answer ${method} within ${timeoutMs}ms`))
       }, timeoutMs)
       if (typeof timer.unref === 'function') timer.unref()
-      this.#pending.set(id, { resolve, reject, timer })
+      this.#pending.set(id, { resolve, reject, timer, method })
       try {
         peer.send(JSON.stringify({ id, method, params }))
       } catch (error) {
@@ -401,6 +490,7 @@ export class TabBridge {
   }
 
   async dispose() {
+    this.#stopHeartbeat()
     this.#peer?.close(1001, 'host shutting down')
     this.#peer = undefined
     this.#failAll(new Error('browser bridge stopped'))

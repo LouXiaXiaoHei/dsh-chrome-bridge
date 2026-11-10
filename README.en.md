@@ -92,7 +92,8 @@ Names outlive numbers: the indices from `chrome_snapshot` are valid only for tha
 | `chrome_tabs` | List operable tabs and their `tabId` |
 | `chrome_snapshot` | Page snapshot: title, URL, heading outline, numbered interactive elements, body text, scroll position |
 | `chrome_click` | Click by `index` (snapshot number) or `name` |
-| `chrome_click_at` | Click a viewport coordinate |
+| `chrome_move` | Move the pointer to an `index` or `x`+`y` without clicking — hover, reveal tooltips, make the motion visible |
+| `chrome_click_at` | Click a viewport `x`+`y`, or a snapshot `index` directly |
 | `chrome_type` | Type text by `index` or `name`; `replace` clears first, `pressEnter` submits |
 | `chrome_press` | Press a key: Enter, Escape, Tab, arrows, Home/End/PageUp/PageDown, letters and digits, with `cmd` / `shift` / `alt` / `ctrl` |
 | `chrome_drag` | Drag from `name` / `index` / `fromX`+`fromY` to `toName` / `toX`+`toY` / `dx`+`dy` |
@@ -100,7 +101,7 @@ Names outlive numbers: the indices from `chrome_snapshot` are valid only for tha
 | `chrome_query` | CSS selector query that can read live form values |
 | `chrome_wait` | Wait for a selector or text to appear (up to 15 seconds) |
 | `chrome_open` | Open a URL in a tab |
-| `chrome_screenshot` | Save a screenshot under `~/.dsh/chrome-tab-shots/` and return its path |
+| `chrome_screenshot` | Screenshot with numbered boxes drawn over the interactive elements (`marks: false` to turn that off); saved under `~/.dsh/chrome-tab-shots/` and handed to the model as an image |
 
 Every tool accepts an optional `tabId` and defaults to the tab you mentioned last with `@`.
 
@@ -108,13 +109,12 @@ Every tool accepts an optional `tabId` and defaults to the tab you mentioned las
 
 Most browser automation calls `dispatchEvent` inside the page, where `isTrusted` is always `false`: anti-bot scripts spot it in one line, sliders and drags do not respond at all, and rich text editors ignore it.
 
-Each action tries three channels in order and stops at the first success:
+Each action tries two channels in order and stops at the first success:
 
 | # | Channel | Where the event comes from | Requires |
 | --- | --- | --- | --- |
 | 1 | CDP | The browser's own input pipeline: `Input.dispatchMouseEvent` / `dispatchKeyEvent` / `insertText` | The extension's `debugger` permission |
 | 2 | Native | macOS process-level delivery: AX `AXPress`, `CGEvent.postToPid`, a global tap | macOS only + Accessibility permission + a compiler |
-| 3 | Synthetic | `dispatchEvent` inside the page | Nothing |
 
 **CDP is the main path.** The event sequence matches a real click (`pointerover → pointermove → pointerdown → mousedown(buttons=1, detail=1) → pointerup → mouseup → click`), it works while Chrome is in the background, it never switches your tab, and the system pointer does not move — press, move and release all happen inside the browser.
 
@@ -131,13 +131,24 @@ Each action tries three channels in order and stops at the first success:
 
 Drag is the one case that cannot avoid global events: a press delivered through `postToPid` carries no in-window position and never lands on the page (`CGAssociateMouseAndMouseCursorPosition(false)` does not stop the pointer being pulled along either). The driver hides the cursor for the duration and puts it back afterwards. **Drag over CDP has none of this problem**, which is one more reason CDP is the main path.
 
-**The synthetic channel is only a fallback.** Results say `synthetic` outright instead of pretending otherwise.
+The in-page `dispatchEvent` path is gone: it bypasses the pointer, its events have `isTrusted === false`, and it amounts to pretending to work behind your back. When both real channels fail, the tool reports the failure instead of quietly routing around it.
 
 > Name-based actions bring the tab to the front only when CDP cannot find the name either, because Chrome only exposes the accessibility tree of the active tab. Actions by `index` or coordinate go over CDP and leave your front window alone.
 
+## Look first, then act
+
+The tools no longer ask the model to guess what the page looks like. Every step is read the elements, look at the picture, then act.
+
+1. `chrome_snapshot` reads the page and gives each interactive element a number plus its viewport coordinate (`@x,y`, tagged `(above)` / `(below)` / `(partly offscreen)` when it is out of view).
+2. `chrome_screenshot` screenshots the tab with those same elements boxed and numbered (the boxes are removed right after the shot), and hands the image to the model directly while also saving it under `~/.dsh/chrome-tab-shots/`.
+3. Act: `chrome_click` / `chrome_type` take an index or a name, `chrome_move` / `chrome_click_at` / `chrome_drag` take coordinates. The points you measure on the image and the coordinates in the snapshot are the same space (viewport CSS pixels).
+
+The boxes are red with a number in the top-left corner and match the numbering from `chrome_snapshot`, so "7 on the image" is "7 in the snapshot".
 ## The pointer on the page
 
-The moment a tab is taken over, the pointer appears on the page: it lands in the middle of the viewport and ripples once. It then stays for the whole takeover — gliding to the target, pressing (darkened, with a ripple), releasing, bobbing where it stopped. Navigate to a new page or let a framework replace the DOM, and it is put back; it only leaves when the takeover moves to another tab or the debugger channel drops.
+The moment a tab is taken over, the pointer appears on the page: it lands in the middle of the viewport and ripples once. It then stays for the whole takeover — gliding to the target, pressing (darkened, with a ripple), releasing. Navigate to a new page or let a framework replace the DOM, and it is put back; it only leaves when the takeover moves to another tab or the debugger channel drops.
+
+**It is the only hand.** Clicks, typing, keys, drags and scrolls never go around it: every action first glides the pointer to the target point, presses, emits the CDP event at that same coordinate, then releases. The glide is a frame-by-frame animation inside the page (`requestAnimationFrame` + ease-in-out), not a CSS transition, so the host knows when it has actually landed and waits for that before pressing — the arrow you see is where the event happens.
 
 It signals the state "this tab is being driven", not a decoration drawn for one tool call.
 

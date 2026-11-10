@@ -14,7 +14,7 @@
 import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join, relative } from 'node:path'
+import { basename, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { BRIDGE_PORTS, CONFIG_PATH, TabBridge } from './bridge.js'
@@ -47,6 +47,47 @@ const TEXT_OUTPUT = {
     required: ['text'],
   },
   render: (_args, value) => [{ type: 'text', text: String(value?.text ?? '') }],
+}
+
+
+/** 截图结果：文本给出路径和尺寸，能存成附件时再附一张图片给模型看。 */
+const SHOT_OUTPUT = {
+  schema: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      text: { type: 'string' },
+      savedTo: { type: 'string' },
+      image: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          attachmentId: { type: 'string' },
+          mediaType: { type: 'string' },
+          bytes: { type: 'number' },
+          width: { type: 'number' },
+          height: { type: 'number' },
+          name: { type: 'string' },
+        },
+        required: ['attachmentId', 'mediaType', 'bytes', 'width', 'height'],
+      },
+    },
+    required: ['text'],
+  },
+  render: (_args, value) => {
+    const blocks = [{ type: 'text', text: String(value?.text ?? '') }]
+    const image = value?.image
+    if (image !== undefined && image !== null && typeof image.attachmentId === 'string') {
+      blocks.push({ type: 'image', attachment: { ...image } })
+    }
+    return blocks
+  },
+}
+
+/** PNG 头里的宽高：截图没有缩放，像素就是画面尺寸。 */
+function pngSize(buffer) {
+  if (buffer.length < 24 || buffer.readUInt32BE(0) !== 0x89504e47) return undefined
+  return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) }
 }
 
 const TAB_ID_PARAMETER = {
@@ -348,8 +389,8 @@ export function apply(ctx, config) {
    */
   /**
    * Map a KeyboardEvent.key name onto the key names the driver knows. The two vocabularies
-   * disagree on the arrows and on the delete family, and a miss here quietly falls back to
-   * synthetic events, so the mapping lives in one place.
+   * disagree on the arrows and on the delete family, and a miss here costs the whole native
+   * attempt, so the mapping lives in one place.
    */
   const nativeKeyName = (key) => {
     const lower = key.toLowerCase()
@@ -399,95 +440,117 @@ export function apply(ctx, config) {
     }
   }
 
+  /**
+   * 指针是页面上唯一的手：移动它、按它、松它，都由这里发起，所有输入都先经过
+   * 它。它返回这次动作的起止点和真实耗时，调用方据此等着——箭头停在按钮上，
+   * 点击才真正发生在那一点。
+   */
+  const pointer = async (tabId, payload) => {
+    try {
+      const outcome = await call('page.pointer', { tabId, payload })
+      // 页面里还没有指针时先生成一只，再从它所在的位置滑过去：第一步也该看得见。
+      if (outcome?.present === false) {
+        await cursor(tabId, {})
+        const retry = await call('page.pointer', { tabId, payload })
+        if (retry !== null && typeof retry === 'object') return retry
+      }
+      if (outcome !== null && typeof outcome === 'object') return outcome
+    } catch {
+      // 页面拒绝注入（chrome:// 之类）时页面上没有这只手，动作本身仍可完成。
+    }
+    return undefined
+  }
+
+  /**
+   * 把指针滑到 (x, y) 并等它真的落地，返回滑行耗时。滑行由页面逐帧推进，
+   * 不是 CSS 过渡，所以宿主知道它什么时候停，而不是凭一个估算时长去赌。
+   */
+  const moveCursor = async (tabId, x, y, ms) => {
+    const payload = ms === undefined ? { action: 'glide', x, y } : { action: 'glide', x, y, ms }
+    const outcome = await pointer(tabId, payload)
+    if (outcome !== undefined && outcome.present === true) return Number(outcome.ms) || 0
+    // 指针没建起来：至少把位置摆对，别让这次操作因为看不见的手而失效。
+    await cursor(tabId, { x, y })
+    return 0
+  }
+
+  const pressPointer = async (tabId, x, y) => {
+    await pointer(tabId, x === undefined ? { action: 'press' } : { action: 'press', x, y })
+  }
+
+  const releasePointer = async (tabId, x, y) => {
+    await pointer(tabId, x === undefined ? { action: 'release' } : { action: 'release', x, y })
+  }
+
+  /** 指针当前停在哪、是不是按着——用来判断“要不要先移过去”。 */
+  const pointerState = async (tabId) => {
+    const outcome = await pointer(tabId, { action: 'state' })
+    return outcome !== undefined && outcome.present === true ? outcome : undefined
+  }
+
   const mouseEvent = (type, x, y, extra = {}) => ({
     method: 'Input.dispatchMouseEvent',
     params: { type, x, y, ...extra },
   })
 
-  /**
-   * How long a slide should take, decided by the distance the pointer has to cover —
-   * long trips get a visible sweep, short corrections stay quick. Running the maths
-   * inside the page keeps it to one round trip: no position has to travel back here.
-   */
-  const slideExpression = (x, y) => `(() => {
-    const el = document.getElementById('__dsh_ai_cursor')
-    if (!el) return { present: false }
-    const m = new DOMMatrixReadOnly(getComputedStyle(el).transform)
-    const fromX = m.m41 + 1.6
-    const fromY = m.m42 + 1.2
-    const distance = Math.hypot(${x} - fromX, ${y} - fromY)
-    const duration = Math.max(240, Math.min(780, 240 + distance * 0.55))
-    el.style.transition = 'transform ' + duration + 'ms cubic-bezier(.22,.9,.28,1)'
-    el.style.transform = 'translate3d(${(x - 1.6).toFixed(1)}px, ${(y - 1.2).toFixed(1)}px, 0)'
-    return { present: true, duration: Math.round(duration), distance: Math.round(distance) }
-  })()`
-
-  /**
-   * Start the pointer travelling towards (x, y) and report how long that takes, so the
-   * caller can wait for it to arrive instead of acting on a pointer still in flight.
-   * The very first call has nowhere to travel from — it plants the pointer and returns 0.
-   */
-  const moveCursor = async (tabId, x, y) => {
-    try {
-      const outcome = await cdp(tabId, [
-        { method: 'Runtime.evaluate', params: { expression: slideExpression(x, y), returnByValue: true } },
-      ])
-      const value = outcome?.results?.[0]?.result?.value
-      if (value !== null && typeof value === 'object' && value.present === true) {
-        return Number(value.duration) || 0
-      }
-    } catch {
-      // Injection may be refused (chrome:// pages); fall through to the plain attempt.
-    }
-    // No pointer on the page yet: plant it, then let the caller act immediately.
-    await cursor(tabId, { x, y })
-    return 0
-  }
-
-  /** Slide the pointer over, wait for it to land, press, release, then ripple. */
-  const cdpClick = async (tabId, x, y, { hover = 80, settle = 40 } = {}) => {
-    const travel = await moveCursor(tabId, x, y)
-    await sleep(travel + hover)
+  /** 滑过去、按下、松开——每一步都看得见，指针落下之后事件才发出。 */
+  const cdpClick = async (tabId, x, y, { hover = 90, settle = 40 } = {}) => {
+    await moveCursor(tabId, x, y)
+    await sleep(hover)
+    await pressPointer(tabId, x, y)
     await cdp(tabId, [
       mouseEvent('mouseMoved', x, y, { buttons: 0 }),
       { ...mouseEvent('mousePressed', x, y, { button: 'left', buttons: 1, clickCount: 1 }), wait: settle },
       mouseEvent('mouseReleased', x, y, { button: 'left', buttons: 0, clickCount: 1 }),
     ])
-    await cursor(tabId, { x, y, pulse: true })
+    await releasePointer(tabId, x, y)
   }
 
+  /** 悬停：把鼠标位置告诉页面，菜单和 tooltip 才会因为指针停在那儿而打开。 */
+  const hoverPointer = async (tabId, x, y) => {
+    try {
+      await cdp(tabId, [mouseEvent('mouseMoved', x, y, { buttons: 0 })])
+      return true
+    } catch {
+      return false
+    }
+  }
   /**
-   * 原生通道走的是系统事件，页面里的指针不会自己跟过去。先把它摆到落点，
-   * 用户看到的才始终是同一只指针在操作，而不是"指针没动、页面自己变了"。
+   * 原生通道走的是系统事件，页面里的指针不会自己跟过去。先把它滑到落点并按一下，
+   * 用户看到的才始终是同一只指针在操作，而不是“指针没动、页面自己变了”。
    */
   const alignCursor = async (tabId, x, y) => {
-    const travel = await moveCursor(tabId, x, y)
-    if (travel > 0) await sleep(travel)
-    await cursor(tabId, { x, y, pulse: true })
+    await moveCursor(tabId, x, y)
+    await pressPointer(tabId, x, y)
+    await sleep(60)
+    await releasePointer(tabId, x, y)
   }
 
   /**
    * 导航会把整个文档连同指针一起换掉。直接跳的话，用户看到的是“页面自己变了、
-   * 指针毫无反应”，所以出发前先让指针动一下：滑到视口中心、按下、涟漪，再放行。
+   * 指针毫无反应”，所以出发前先让指针滑到视口中心、按下、涟漪，再放行。
    * 到达新页面后扩展会把指针放回视口中心，一来一去接得上。
    */
   const departCursor = async (tabId) => {
     let center
-    try {
-      const metrics = await call('page.metrics', { tabId })
-      if (Number(metrics?.innerWidth) > 0) {
-        center = [Math.round(metrics.innerWidth / 2), Math.round(metrics.innerHeight / 2)]
+    const state = await pointerState(tabId)
+    const view = state === undefined ? undefined : state.viewport
+    if (view !== undefined && Number(view.width) > 0) {
+      center = [Math.round(Number(view.width) / 2), Math.round(Number(view.height) / 2)]
+    } else {
+      try {
+        const metrics = await call('page.metrics', { tabId })
+        if (Number(metrics?.innerWidth) > 0) {
+          center = [Math.round(metrics.innerWidth / 2), Math.round(metrics.innerHeight / 2)]
+        }
+      } catch {
+        // 内页拒绝注入时拿不到尺寸，就在原地示意一下。
       }
-    } catch {
-      // 内页拒绝注入时拿不到尺寸，就在原地示意一下。
     }
-    if (center !== undefined) {
-      const travel = await moveCursor(tabId, center[0], center[1])
-      if (travel > 0) await sleep(travel)
-    }
-    await cursor(tabId, { pressed: true, pulse: true })
+    if (center !== undefined) await moveCursor(tabId, center[0], center[1])
+    await pressPointer(tabId)
     await sleep(140)
-    await cursor(tabId, { pressed: false })
+    await releasePointer(tabId)
   }
 
   const CDP_KEY = {
@@ -531,7 +594,9 @@ export function apply(ctx, config) {
    * puts the pointer exactly where the user would click, which is what makes the on-screen
    * cursor land on the element rather than on whatever container swallowed the hit test.
    */
-  const cdpLocate = async (tabId, name) => {
+  const cdpLocate = async (tabId, name, options = {}) => {
+    // scroll:false 时不把元素滚进视口，只回报它现在的位置——滚动工具要用这个位置决定往哪滚。
+    const shouldScroll = options.scroll !== false
     const expression = `(() => {
       const needle = ${'${JSON.stringify(name)}'}.trim().toLowerCase();
       const nodes = [...document.querySelectorAll('a,button,input,textarea,select,summary,label,[role],[contenteditable],[tabindex],[aria-label],[title],[placeholder]')];
@@ -561,11 +626,15 @@ export function apply(ctx, config) {
         if (s > best) { best = s; hit = el; }
       }
       if (hit === null) return JSON.stringify({ error: 'no-match' });
-      hit.scrollIntoView({ block: 'center', inline: 'nearest' });
+      if (${shouldScroll}) hit.scrollIntoView({ block: 'center', inline: 'nearest' });
       const r = box(hit);
       if (r.width < 2 || r.height < 2) return JSON.stringify({ error: 'not-visible' });
       const label = (hit.getAttribute('aria-label') || hit.getAttribute('placeholder') || hit.getAttribute('title') || textOf(hit) || hit.tagName).replace(/\\s+/g, ' ').trim().slice(0, 48);
-      return JSON.stringify({ x: r.left + r.width / 2, y: r.top + r.height / 2, tag: hit.tagName.toLowerCase(), label });
+      return JSON.stringify({
+        x: r.left + r.width / 2, y: r.top + r.height / 2,
+        top: r.top, bottom: r.bottom, centerY: r.top + r.height / 2,
+        tag: hit.tagName.toLowerCase(), label,
+      });
     })()`
     const { results } = await cdp(tabId, [{
       method: 'Runtime.evaluate',
@@ -621,45 +690,44 @@ export function apply(ctx, config) {
     return sent
   }
 
-  /** Press at one point, glide to another, release — the sequence sliders and sortables expect. */
   /**
-   * Press at one point, drag to another, release. The pointer is moved in the page
-   * between legs as well, so what the eye follows and what the page receives stay
-   * together — a slider being dragged looks dragged, not teleported.
+   * 按住一处、拖到另一处、松开。指针一次滑完整条路径，浏览器的 mouseMoved 在
+   * 途中分段发出，所以眼睛看到的拖动和页面收到的拖动是同一次。
    */
   const cdpDrag = async (tabId, from, to, steps) => {
-    const travel = await moveCursor(tabId, from[0], from[1])
-    await sleep(travel + 60)
-    await cursor(tabId, { x: from[0], y: from[1], pressed: true })
-    await sleep(70)
+    await moveCursor(tabId, from[0], from[1])
+    await sleep(60)
+    await pressPointer(tabId, from[0], from[1])
     await cdp(tabId, [
       mouseEvent('mouseMoved', from[0], from[1], { buttons: 0 }),
       { ...mouseEvent('mousePressed', from[0], from[1], { button: 'left', buttons: 1, clickCount: 1 }), wait: 40 },
     ])
 
+    const distance = Math.hypot(to[0] - from[0], to[1] - from[1])
+    const glide = Math.round(Math.max(240, Math.min(760, 200 + distance * 0.55)))
+    // 先让指针出发，再在它走路的过程中把中间的鼠标位置喂给页面。
+    const travelling = moveCursor(tabId, to[0], to[1], glide)
     const legs = Math.max(3, Math.min(steps, 14))
     for (let leg = 1; leg <= legs; leg += 1) {
       const body = []
       const start = (leg - 1) / legs
       const end = leg / legs
-      const perLeg = Math.max(2, Math.round(steps / legs))
+      const perLeg = Math.max(2, Math.round(legs / 2))
       for (let slice = 1; slice <= perLeg; slice += 1) {
         const t = start + ((end - start) * slice) / perLeg
         const x = from[0] + (to[0] - from[0]) * t
         const y = from[1] + (to[1] - from[1]) * t
         body.push({ ...mouseEvent('mouseMoved', x, y, { button: 'left', buttons: 1 }), wait: 10 })
       }
-      const tipX = from[0] + (to[0] - from[0]) * end
-      const tipY = from[1] + (to[1] - from[1]) * end
-      const legTravel = await moveCursor(tabId, tipX, tipY)
       await cdp(tabId, body)
-      await sleep(Math.min(legTravel, 140) + 16)
+      if (leg < legs) await sleep(Math.max(16, Math.round(glide / legs) - 24))
     }
+    await travelling
 
     await cdp(tabId, [
       { ...mouseEvent('mouseReleased', to[0], to[1], { button: 'left', buttons: 0, clickCount: 1 }), wait: 30 },
     ])
-    await cursor(tabId, { x: to[0], y: to[1], pulse: true })
+    await releasePointer(tabId, to[0], to[1])
   }
 
   /** Press and release one key through the browser, with optional modifier mask. */
@@ -686,9 +754,9 @@ export function apply(ctx, config) {
   /**
    * Try each input channel in order and report which one actually ran.
    *
-   * CDP is the most faithful (the browser generates the events), the macOS native
-   * driver is the fallback that works when the tab refuses debugging, and synthetic
-   * events are the last resort for pages that block both.
+   * CDP is the most faithful (the browser generates the events) and the macOS native
+   * driver is the fallback for tabs that refuse debugging. There is deliberately no
+   * third channel: if both real ones fail, the action fails loudly.
    */
   const requireDriver = async () => {
     const driver = await nativeDriver()
@@ -900,6 +968,28 @@ export function apply(ctx, config) {
     },
   })
 
+  // 最近一次快照的坐标：编号 → 视口点。agent 看完图之后要指哪儿就点哪儿，
+  // 不必再用文字去描述元素。
+  let lastSnapshot
+
+  /** 编号或坐标都认：编号来自最近一次快照，坐标来自 agent 看图选的落点。 */
+  const pointFromArgs = async (args, tabId) => {
+    const index = Number(args?.index)
+    if (Number.isFinite(index) && index >= 1) {
+      if (lastSnapshot !== undefined && lastSnapshot.tabId === tabId) {
+        const box = lastSnapshot.boxes.find((item) => Number(item.n) === index)
+        if (box !== undefined) {
+          return { x: Number(box.x), y: Number(box.y), tag: 'element', label: '#' + index }
+        }
+      }
+      const target = await call('page.targetBox', { tabId, index })
+      return { x: Number(target.x), y: Number(target.y), tag: target.tag, label: target.label }
+    }
+    const x = Number(args?.x)
+    const y = Number(args?.y)
+    if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error('give x and y, or index')
+    return { x, y, tag: undefined, label: undefined }
+  }
   register({
     name: 'chrome_snapshot',
     description:
@@ -916,6 +1006,7 @@ export function apply(ctx, config) {
         maxInteractive: settings.maxInteractiveItems,
         maxText: 12000,
       })
+      if (Array.isArray(snapshot.boxes)) lastSnapshot = { tabId, boxes: snapshot.boxes, at: Date.now() }
       const lines = [`URL: ${snapshot.url}`, `Title: ${snapshot.title}`]
       if (snapshot.headings?.length) {
         lines.push(`Headings:\n${snapshot.headings.map((line) => `  - ${line}`).join('\n')}`)
@@ -926,8 +1017,16 @@ export function apply(ctx, config) {
       } else {
         lines.push('Interactive elements: none found')
       }
+      // 编号后面的 @x,y 是视口坐标：可以直接交给 chrome_click_at / chrome_drag，
+      // 也可以和截图上的编号框对上——看图选编号，再按编号点，路径就闭合了。
+      if (snapshot.interactive?.length) lines.push('(@x,y are viewport CSS pixels, usable as click_at / drag points)')
       if (snapshot.scroll) {
         lines.push(`Scroll: y=${snapshot.scroll.y} of ${snapshot.scroll.height}, viewport ${snapshot.scroll.viewport}px`)
+      }
+      // 指针就是页面上那只手：先告诉 agent 它现在停在哪，下一步才谈得上"移过去"。
+      const cursor = await pointerState(tabId)
+      if (cursor !== undefined) {
+        lines.push(`Cursor: ${Math.round(cursor.x)},${Math.round(cursor.y)}${cursor.pressed ? ' (pressed)' : ''}`)
       }
       lines.push(`Reading text:\n${snapshot.text ?? ''}`)
       let rendered = lines.join('\n')
@@ -1006,37 +1105,61 @@ export function apply(ctx, config) {
             return { element: result.element, how: result.how }
           },
         },
-        {
-          name: 'synthetic',
-          run: async () => {
-            await call('page.clickAt', { tabId, x: target.x, y: target.y })
-            return { element: target.tag, how: 'synthetic' }
-          },
-        },
       ])
       const named = target.label ? ` "${target.label}"` : ''
-      const path = outcome.channel === 'synthetic'
-        ? `synthetic mouse events (${outcome.tried.join('; ')})`
-        : `the trusted ${outcome.channel} input channel`
+      const path = `the trusted ${outcome.channel} input channel`
       return { text: `Clicked ${index} (${target.tag}${named}) at ${Math.round(target.x)},${Math.round(target.y)} via ${path}.` }
     },
   })
 
   register({
-    name: 'chrome_click_at',
-    description: 'Click a raw viewport coordinate in the current tab, for targets chrome_snapshot cannot index.',
+    name: 'chrome_move',
+    description:
+      'Move the on-screen pointer to a viewport point without clicking — the same hand that clicks, so hovering '
+      + 'opens menus and tooltips while nothing else is touched. Give x,y, or an index from the last '
+      + `chrome_snapshot. ${UNTRUSTED}`,
     parameters: {
-      x: { type: 'number', required: true, description: 'Viewport x in CSS pixels.' },
-      y: { type: 'number', required: true, description: 'Viewport y in CSS pixels.' },
+      x: { type: 'number', description: 'Viewport x in CSS pixels, together with y.' },
+      y: { type: 'number', description: 'Viewport y in CSS pixels, together with x.' },
+      index: { type: 'number', description: 'Element index from the last chrome_snapshot, instead of x,y.' },
       tabId: TAB_ID_PARAMETER,
     },
     output: TEXT_OUTPUT,
     timeoutMs: settings.toolTimeoutMs,
     execute: async (args) => {
       const tabId = await resolveTab(args?.tabId)
-      const x = Number(args?.x)
-      const y = Number(args?.y)
-      if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error('x and y must be numbers')
+      const point = await pointFromArgs(args, tabId)
+      const travel = await moveCursor(tabId, point.x, point.y)
+      const hovered = await hoverPointer(tabId, point.x, point.y)
+      await sleep(60)
+      const at = `${Math.round(point.x)},${Math.round(point.y)}`
+      return {
+        text: `Pointer moved to ${at}`
+          + `${point.label ? ' over ' + point.label : ''} in ${Number(travel) || 0}ms`
+          + `${hovered ? '.' : ' (the page refused hover events).'}`
+      }
+    },
+  })
+
+  register({
+    name: 'chrome_click_at',
+    description:
+      'Click a viewport point. The pointer glides there first — you watch it travel — and the press happens at '
+      + 'that exact spot. Give x,y, or an index from the last chrome_snapshot. Use it for anything '
+      + `chrome_snapshot cannot index, such as a spot on an image. ${UNTRUSTED}`,
+    parameters: {
+      x: { type: 'number', description: 'Viewport x in CSS pixels, together with y.' },
+      y: { type: 'number', description: 'Viewport y in CSS pixels, together with x.' },
+      index: { type: 'number', description: 'Element index from the last chrome_snapshot, instead of x,y.' },
+      tabId: TAB_ID_PARAMETER,
+    },
+    output: TEXT_OUTPUT,
+    timeoutMs: settings.toolTimeoutMs,
+    execute: async (args) => {
+      const tabId = await resolveTab(args?.tabId)
+      const point = await pointFromArgs(args, tabId)
+      const x = point.x
+      const y = point.y
       const outcome = await runChannels([
         {
           name: 'cdp',
@@ -1050,22 +1173,16 @@ export function apply(ctx, config) {
           run: async () => {
             const driver = await requireDriver()
             const live = await focusableTab(tabId)
-            const point = await screenPoint(driver, live, x, y)
-            return driver.call('clickAt', { x: point.x, y: point.y, title: live.title })
-          },
-        },
-        {
-          name: 'synthetic',
-          run: async () => {
-            await call('page.clickAt', { tabId, x, y })
-            return { how: 'synthetic' }
+            const screen = await screenPoint(driver, live, x, y)
+            // 系统鼠标点之前，页面里的指针先滑到同一点：两条通道看到的是同一只手。
+            await alignCursor(tabId, x, y)
+            return driver.call('clickAt', { x: screen.x, y: screen.y, title: live.title })
           },
         },
       ])
-      const via = outcome.channel === 'synthetic'
-        ? `synthetic mouse events (${outcome.tried.join('; ')})`
-        : `the trusted ${outcome.channel} input channel`
-      return { text: `Clicked at ${x},${y} via ${via}.` }
+      const at = `${Math.round(x)},${Math.round(y)}`
+      const named = point.label ? ` (${point.label})` : ''
+      return { text: `Clicked at ${at}${named} via the trusted ${outcome.channel} input channel.` }
     },
   })
 
@@ -1255,20 +1372,10 @@ export function apply(ctx, config) {
             return { how: 'native' }
           },
         },
-        {
-          name: 'synthetic',
-          run: async () => {
-            const focus = await call('page.focus', { tabId, index })
-            if (!focus.editable) throw new Error(`index ${index} is a ${focus.tag}, which does not accept typed text`)
-            await call('page.insertText', { tabId, text: value, replace })
-            if (enter) await call('page.key', { tabId, key: 'Enter' })
-            return { how: 'synthetic' }
-          },
-        },
       ])
       return {
-        text: `Typed ${value.length} characters into ${index} (${target.tag}) via `
-          + `${outcome.channel === 'synthetic' ? `synthetic events (${outcome.tried.join('; ')})` : `trusted key events via ${outcome.channel}`}`
+        text: `Typed ${value.length} characters into ${index} (${target.tag}) at ${Math.round(target.x)},${Math.round(target.y)} via `
+          + `trusted key events on the ${outcome.channel} channel`
           + `${enter ? ' and pressed Enter' : ''}.`,
       }
     },
@@ -1317,21 +1424,11 @@ export function apply(ctx, config) {
             return { how: 'native' }
           },
         },
-        {
-          name: 'synthetic',
-          run: async () => {
-            if (modifiers.length > 0) throw new Error('合成事件无法携带修饰键')
-            await call('page.key', { tabId, key })
-            return { how: 'synthetic' }
-          },
-        },
       ])
       const holding = modifiers.length > 0 ? `${modifiers.join('+')}+` : ''
       // 按键不会移动指针，但操作确实发生在这个页面上：让指针在原地涟漪一下当作回执。
       await cursor(tabId, { pulse: true })
-      const via = outcome.channel === 'synthetic'
-        ? `synthetic events (${outcome.tried.join('; ')})`
-        : `trusted key events via ${outcome.channel}`
+      const via = `trusted key events via ${outcome.channel}`
       return { text: `Pressed ${holding}${key} via ${via}.` }
     },
   })
@@ -1363,8 +1460,27 @@ export function apply(ctx, config) {
         {
           name: 'cdp',
           run: async () => {
-            if (name !== undefined) throw new Error('按名字滚动要滚到元素，CDP 只能滚视口')
             const metrics = await call('page.metrics', { tabId })
+            if (name !== undefined) {
+              // 滚到某个元素：指针先滑到元素现在的位置，滚轮就从那个点发出，
+              // 滚动量取「元素中心到视口中心」的差，落点还能再核对一次。
+              const box = await cdpLocate(tabId, name, { scroll: false })
+              const clampX = Math.round(Math.min(Math.max(box.x, 12), Math.max(metrics.innerWidth - 12, 12)))
+              const clampY = Math.round(Math.min(Math.max(box.y, 12), Math.max(metrics.innerHeight - 12, 12)))
+              await moveCursor(tabId, clampX, clampY)
+              await sleep(40)
+              await cdp(tabId, [{
+                method: 'Input.dispatchMouseEvent',
+                params: { type: 'mouseWheel', x: clampX, y: clampY, deltaX: 0, deltaY: Math.round(box.centerY - metrics.innerHeight / 2) },
+              }])
+              await sleep(220)
+              const after = await call('page.metrics', { tabId })
+              const landed = await cdpLocate(tabId, name, { scroll: false })
+              if (landed.top < 0 || landed.bottom > after.innerHeight) {
+                throw new Error('"' + name + '" 没能滚进视口')
+              }
+              return { how: 'cdp', y: after.scrollY, height: after.scrollHeight }
+            }
             const deltaY = to === 'top'
               ? -metrics.scrollY
               : to === 'bottom'
@@ -1372,8 +1488,8 @@ export function apply(ctx, config) {
                 : amount
             const x = Math.round(Math.max(metrics.innerWidth, 1) / 2)
             const y = Math.round(Math.max(metrics.innerHeight, 1) / 2)
-            const travel = await moveCursor(tabId, x, y)
-            await sleep(travel + 50)
+            await moveCursor(tabId, x, y)
+            await sleep(50)
             await cdp(tabId, [
               { method: 'Input.dispatchMouseEvent', params: { type: 'mouseWheel', x, y, deltaX: 0, deltaY } },
             ])
@@ -1397,15 +1513,6 @@ export function apply(ctx, config) {
             return driver.call('scroll', { pages: amount < 0 ? -pages : pages, title: live.title })
           },
         },
-        {
-          name: 'synthetic',
-          run: async () => {
-            if (name !== undefined) throw new Error('按名字滚动需要原生通道')
-            if (to !== undefined) throw new Error('跳到顶部或底部需要原生或 CDP 通道')
-            await call('page.scroll', { tabId, amount })
-            return { how: 'synthetic' }
-          },
-        },
       ])
 
       const what = name !== undefined
@@ -1413,9 +1520,7 @@ export function apply(ctx, config) {
         : to !== undefined
           ? `to the ${to}`
           : `${amount > 0 ? 'down' : 'up'} ${Math.abs(amount)}px`
-      const how = outcome.channel === 'synthetic'
-        ? `synthetic events (${outcome.tried.join('; ')})`
-        : `a trusted ${outcome.channel === 'cdp' ? 'wheel' : 'scroll'} gesture`
+      const how = `a trusted ${outcome.channel === 'cdp' ? 'wheel' : 'scroll'} gesture`
       const where = typeof outcome.value?.y === 'number'
         ? ` Page is at ${outcome.value.y}${typeof outcome.value?.height === 'number' ? ` of ${outcome.value.height}` : ''}.`
         : ''
@@ -1514,27 +1619,57 @@ export function apply(ctx, config) {
 
   register({
     name: 'chrome_screenshot',
-    description: 'Capture the current tab as a PNG file so you can see the page layout.',
-    parameters: { tabId: TAB_ID_PARAMETER },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: { savedTo: { type: 'string' } },
-        required: ['savedTo'],
-      },
-      render: (_args, value) => [{ type: 'text', text: `Screenshot saved to ${value.savedTo}` }],
+    description:
+      'Look at the current tab. Snapshot elements are outlined and numbered on the shot, so you can aim the '
+      + 'pointer by eye when the target is canvas, an image map, or something chrome_snapshot cannot index. '
+      + `Page pixels and viewport CSS pixels line up on this shot. ${UNTRUSTED}`,
+    parameters: {
+      marks: { type: 'boolean', description: 'Draw numbered boxes on the snapshot elements. Defaults to true.' },
+      tabId: TAB_ID_PARAMETER,
     },
+    output: SHOT_OUTPUT,
     timeoutMs: settings.toolTimeoutMs,
     execute: async (args) => {
       const tabId = await resolveTab(args?.tabId)
-      const result = await call('page.screenshot', { tabId })
+      const wantMarks = args?.marks !== false
+      const result = await call('page.shot', { tabId, marks: wantMarks })
       const base64 = String(result?.base64 ?? '')
       if (base64 === '') throw new Error('the extension returned no image data')
+      const buffer = Buffer.from(base64, 'base64')
       mkdirSync(SHOT_DIR, { recursive: true })
       const savedTo = join(SHOT_DIR, `${Date.now()}-${randomUUID().slice(0, 8)}.png`)
-      writeFileSync(savedTo, Buffer.from(base64, 'base64'))
-      return { savedTo }
+      writeFileSync(savedTo, buffer)
+      const size = pngSize(buffer)
+      const dimensions = size === undefined ? '' : `, ${size.width}x${size.height} px`
+      const marked = result?.marked === true
+      let image
+      try {
+        const attachments = ctx.get('attachments')
+        if (attachments !== undefined && typeof attachments.saveImage === 'function') {
+          const ref = await attachments.saveImage({ data: buffer, mediaType: 'image/png', name: basename(savedTo) })
+          image = {
+            attachmentId: ref.attachmentId,
+            mediaType: ref.mediaType,
+            bytes: ref.bytes,
+            width: ref.width,
+            height: ref.height,
+            ...(ref.name === undefined ? {} : { name: ref.name }),
+          }
+        }
+      } catch {
+        image = undefined
+      }
+      const text = [
+        `Screenshot of the tab${dimensions}, saved to ${savedTo}.`,
+        marked
+          ? 'Snapshot elements are outlined and numbered on it: each number is the index chrome_snapshot gave '
+            + 'that element, and the centre of its box is where chrome_move and chrome_click_at aim when you pass the index.'
+          : '',
+        'Measure a point on the image and pass those numbers to chrome_click_at; the pointer glides there before it presses.',
+      ].filter((line) => line !== '').join(' ')
+      // 图片能直接交到模型眼前最好；交不了就明确告诉它用 read_image 自己去看这个文件。
+      const hint = image === undefined ? ' Open it with read_image to see it.' : ''
+      return image === undefined ? { text: text + hint, savedTo } : { text, savedTo, image }
     },
   })
 }
