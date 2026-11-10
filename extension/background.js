@@ -530,6 +530,10 @@ async function attachDebugger(tabId) {
     // 不等到第一次点击才凭空冒出来。
     engagedTabs.add(tabId)
     void ensureCursor(tabId)
+    // 文档常常还在加载：过一拍再确认一次，别让这一次落空变成整段接管没有指针。
+    setTimeout(() => {
+      if (engagedTabs.has(tabId)) void ensureCursor(tabId)
+    }, 400)
   })()
   attaching.set(tabId, work)
   try {
@@ -539,11 +543,35 @@ async function attachDebugger(tabId) {
   }
 }
 
-async function ensureCursor(tabId, payload) {
+// 接管往往正好赶上换文档：那时注入会落空。光标只等一次就可能整段缺席，
+// 所以失败要退避着重试，等文档稳下来再补。
+const cursorRetries = new Map()
+
+function scheduleCursorRetry(tabId, payload, attempt) {
+  if (attempt >= 3) return
+  const pending = cursorRetries.get(tabId)
+  if (pending !== undefined) clearTimeout(pending)
+  const timer = setTimeout(() => {
+    cursorRetries.delete(tabId)
+    if (engagedTabs.has(tabId)) void ensureCursor(tabId, payload, attempt + 1)
+  }, 200 * 2 ** attempt)
+  cursorRetries.set(tabId, timer)
+}
+
+async function ensureCursor(tabId, payload, attempt = 0) {
+  const options = payload === undefined ? {} : payload
   try {
-    return await runInPage(tabId, fnCursor, payload === undefined ? {} : payload)
+    const result = await runInPage(tabId, fnCursor, options)
+    const pending = cursorRetries.get(tabId)
+    if (pending !== undefined) {
+      clearTimeout(pending)
+      cursorRetries.delete(tabId)
+    }
+    return result
   } catch {
-    // 内部页面注入不了；光标只是装饰，不该让接管因此失败。
+    // 内部页面注入不了，或者页面正在换文档；光标只是装饰，不该让接管因此失败，
+    // 但也不能就这么丢掉——退避重试，别让它等到下一次点击才回来。
+    if (options.mode !== 'release') scheduleCursorRetry(tabId, options, attempt)
     return undefined
   }
 }
