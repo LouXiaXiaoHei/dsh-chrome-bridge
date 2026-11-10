@@ -60,6 +60,15 @@ check('twelve tools are advertised', toolNames.length === 12, `${toolNames.lengt
 check('tool names are unique', new Set(toolNames).size === toolNames.length)
 check('the deprecated eval tool is gone', !toolNames.includes('chrome_eval'))
 
+// 导航不是“页面自己变了”：指针要先滑到中心、按下、涟漪，然后才放行。
+check(
+  'the pointer acts before the page leaves',
+  /const departCursor = async \(tabId\) =>/u.test(host)
+    && host.includes('await departCursor(tabId)')
+    && host.includes('await departCursor(currentTabId)'),
+  'chrome_open must give the pointer a departure',
+)
+
 const failed = results.filter((ok) => ok !== true).length
 console.log('')
 console.log(`${results.length - failed}/${results.length} passed`)

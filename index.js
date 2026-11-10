@@ -466,6 +466,30 @@ export function apply(ctx, config) {
     await cursor(tabId, { x, y, pulse: true })
   }
 
+  /**
+   * 导航会把整个文档连同指针一起换掉。直接跳的话，用户看到的是“页面自己变了、
+   * 指针毫无反应”，所以出发前先让指针动一下：滑到视口中心、按下、涟漪，再放行。
+   * 到达新页面后扩展会把指针放回视口中心，一来一去接得上。
+   */
+  const departCursor = async (tabId) => {
+    let center
+    try {
+      const metrics = await call('page.metrics', { tabId })
+      if (Number(metrics?.innerWidth) > 0) {
+        center = [Math.round(metrics.innerWidth / 2), Math.round(metrics.innerHeight / 2)]
+      }
+    } catch {
+      // 内页拒绝注入时拿不到尺寸，就在原地示意一下。
+    }
+    if (center !== undefined) {
+      const travel = await moveCursor(tabId, center[0], center[1])
+      if (travel > 0) await sleep(travel)
+    }
+    await cursor(tabId, { pressed: true, pulse: true })
+    await sleep(140)
+    await cursor(tabId, { pressed: false })
+  }
+
   const CDP_KEY = {
     enter: ['Enter', 'Enter', 13],
     tab: ['Tab', 'Tab', 9],
@@ -1127,6 +1151,8 @@ export function apply(ctx, config) {
               const to = await screenPoint(driver, live, toCss[0], toCss[1])
               params.to = [to.x, to.y]
             }
+            // 原生拖拽会挪动系统指针，页面里那只也要先滑到起点，用户才看到同一只手在拖。
+            if (fromCss !== undefined) await alignCursor(tabId, fromCss[0], fromCss[1])
             const result = await driver.call('drag', params)
             return { from: result.from, to: result.to, how: 'native' }
           },
@@ -1301,6 +1327,8 @@ export function apply(ctx, config) {
         },
       ])
       const holding = modifiers.length > 0 ? `${modifiers.join('+')}+` : ''
+      // 按键不会移动指针，但操作确实发生在这个页面上：让指针在原地涟漪一下当作回执。
+      await cursor(tabId, { pulse: true })
       const via = outcome.channel === 'synthetic'
         ? `synthetic events (${outcome.tried.join('; ')})`
         : `trusted key events via ${outcome.channel}`
@@ -1409,12 +1437,16 @@ export function apply(ctx, config) {
       const url = String(args?.url ?? '').trim()
       if (!/^https?:\/\//iu.test(url)) throw new Error('url must start with http:// or https://')
       if (args?.newTab === true) {
+        // 出发前让旧标签上的指针点一下，页面才不是“自己变出来的”。
+        if (currentTabId !== undefined) await departCursor(currentTabId)
         const created = await call('tabs.open', { url })
         const tab = created?.tab
         if (tab?.id !== undefined) await remember(tab.id)
         return { text: `Opened ${url} in new tab ${tab?.id ?? '?'}.` }
       }
       const tabId = await resolveTab(args?.tabId)
+      // 先让指针动起来再跳：页面换成新的，指针的出发和到达都在场。
+      await departCursor(tabId)
       await call('page.navigate', { tabId, url })
       return { text: `Navigated tab ${tabId} to ${url}.` }
     },
