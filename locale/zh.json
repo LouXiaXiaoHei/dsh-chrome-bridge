@@ -1,0 +1,12 @@
+{
+  "meta": {
+    "title": "Chrome 标签页",
+    "description": "用 @ 引用正在浏览的 Chrome 标签页，让模型读取并操作它。"
+  },
+  "section.tabs": "Chrome 标签页",
+  "section.windows": "其他窗口",
+  "candidate.disconnected": "浏览器扩展未连接",
+  "candidate.empty": "没有打开的标签页",
+  "candidate.controlled": "当前受控",
+  "header.current": "当前标签页"
+}

@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>DSH Chrome Tab Bridge</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      margin: 0;
+      padding: 14px 16px;
+      width: 272px;
+      font: 13px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    }
+    h1 { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
+    p { margin: 0 0 6px; }
+    .muted { opacity: .62; }
+    .row { display: flex; align-items: baseline; gap: 6px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #c2c7cf; flex: none; }
+    .dot.on { background: #17a34a; }
+    .dot.off { background: #dc2626; }
+    code { font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    button {
+      margin-top: 10px;
+      width: 100%;
+      padding: 6px 10px;
+      border-radius: 7px;
+      border: 1px solid currentColor;
+      background: transparent;
+      color: inherit;
+      font: inherit;
+      cursor: pointer;
+      opacity: .85;
+    }
+    button:hover { opacity: 1; }
+  </style>
+</head>
+<body>
+  <h1>DSH Chrome Tab Bridge</h1>
+  <div class="row"><span class="dot" id="dot"></span><span id="status">检查中…</span></div>
+  <p class="muted" id="bridge"></p>
+  <p class="muted" id="detail"></p>
+  <p class="muted">在 DeepSeek Harness 输入框键入 <code>@</code> 即可选中本浏览器里打开的标签页。</p>
+  <button id="retry" type="button">立即重连</button>
+  <script src="popup.js"></script>
+</body>
+</html>

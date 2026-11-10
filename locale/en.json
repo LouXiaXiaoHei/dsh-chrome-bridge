@@ -1,0 +1,12 @@
+{
+  "meta": {
+    "title": "Chrome tabs",
+    "description": "Mention a live Chrome tab with @ so the agent can read and drive it."
+  },
+  "section.tabs": "Chrome tabs",
+  "section.windows": "Other windows",
+  "candidate.disconnected": "Browser extension not connected",
+  "candidate.empty": "No open tabs",
+  "candidate.controlled": "Controlled",
+  "header.current": "Current tab"
+}

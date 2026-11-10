@@ -1,0 +1,63 @@
+<!doctype html><meta charset="utf-8"><title>trust probe</title>
+<style>
+ body{margin:0;font:14px -apple-system;background:#111;color:#eee}
+ #btn{position:absolute;left:300px;top:200px;width:160px;height:60px;background:#2d7;color:#000;border:0;border-radius:8px;font-size:16px}
+ #ta{position:absolute;left:300px;top:300px;width:300px;height:60px;font-size:14px}
+ #sl{position:absolute;left:300px;top:400px;width:300px}#dv{position:absolute;left:700px;top:200px;width:200px;height:200px;background:#246;display:flex;align-items:center;justify-content:center}#sc{position:absolute;left:700px;top:430px;width:200px;height:120px;overflow:auto;background:#222}#sc>div{height:600px}#log{position:absolute;left:10px;top:520px;font:11px monospace;white-space:pre;color:#8f8}
+</style>
+<button id="btn">登录</button>
+<textarea id="ta" placeholder="rich"></textarea>
+<input id="sl" type="range" min="0" max="100" value="50" aria-label="音量">
+<div id="dv">drag me</div>
+<div id="sc"><div>scroll</div></div>
+<div id="far" style="position:absolute;left:40px;top:1800px;width:300px;height:60px;background:#2a4">远处元素 far</div>
+<div id="ed" contenteditable="true" role="textbox" aria-label="富文本区" style="position:absolute;left:1000px;top:300px;width:320px;height:120px;background:#1b1b1b;border:1px solid #444;padding:6px;overflow:auto">富文本起点</div>
+<div id="hit" style="position:absolute;left:10px;top:490px;font:12px monospace;color:#fd0">-</div>
+<div id="log"></div>
+<script>
+window.__ev = []
+const post = (path, data) => fetch(path, { method: 'POST', body: JSON.stringify(data), keepalive: true }).catch(() => {})
+const rec = (e) => {
+  const row = { t: e.type, trusted: e.isTrusted, x: Math.round(e.clientX * 10) / 10, y: Math.round(e.clientY * 10) / 10 }
+  if (e.screenX !== undefined) row.sx = e.screenX
+  if (e.screenY !== undefined) row.sy = e.screenY
+  if (e.pointerId !== undefined) row.pointerId = e.pointerId
+  if (e.pointerType !== undefined) row.pointerType = e.pointerType
+  if (e.buttons !== undefined) row.buttons = e.buttons
+  if (e.detail !== undefined) row.detail = e.detail
+  if (e.key !== undefined) row.key = e.key
+  if (e.code !== undefined) row.code = e.code
+  if (e.data !== undefined && e.data !== null) row.data = e.data
+  if (e.inputType !== undefined) row.inputType = e.inputType
+  if (e.composed !== undefined) row.composed = e.composed
+  if (e.target && 'value' in e.target) row.val = e.target.value
+  if (e.type === 'scroll' && e.target && e.target.scrollTop !== undefined) row.st = e.target.scrollTop
+  window.__ev.push(row)
+  if (e.type === 'pointerdown') document.getElementById('hit').textContent = Math.round(e.clientX) + ',' + Math.round(e.clientY) + ',' + (e.isTrusted ? 'trusted' : 'untrusted')
+  document.getElementById('log').textContent = window.__ev.slice(-16).map(r => JSON.stringify(r)).join('\n')
+  post('/log', row)
+}
+for (const t of ['dragstart','drag','dragend','drop','scroll','change','pointerover','pointerenter','pointerdown','pointermove','pointerup','mousedown','mousemove','mouseup','click','dblclick','mouseover','mouseenter','contextmenu','wheel']) {
+  window.addEventListener(t, rec, true)
+}
+for (const t of ['keydown','keypress','keyup','beforeinput','input','focus','blur']) {
+  window.addEventListener(t, rec, true)
+}
+const geo = () => {
+  const b = document.getElementById('btn').getBoundingClientRect()
+  const t = document.getElementById('ta').getBoundingClientRect()
+  post('/geom', {
+    dpr: devicePixelRatio,
+    inner: [innerWidth, innerHeight],
+    outer: [outerWidth, outerHeight],
+    screen: [screenX, screenY],
+    screenXY: [window.screenX, window.screenY],
+    moz: [window.mozInnerScreenX, window.mozInnerScreenY],
+    btn: { x: b.x, y: b.y, w: b.width, h: b.height, cx: b.x + b.width / 2, cy: b.y + b.height / 2 },
+    ta: { cx: t.x + t.width / 2, cy: t.y + t.height / 2 },
+    chromeUI: outerHeight - innerHeight,
+  })
+}
+geo()
+addEventListener('resize', geo)
+</script>

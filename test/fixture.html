@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>DSH Chrome Tab fixture</title>
+    <style>
+      body { font: 16px/1.5 system-ui, sans-serif; margin: 24px; }
+      #tall { height: 2400px; background: linear-gradient(#fff, #cfe3ff); margin-top: 16px; }
+      #late { margin-top: 16px; }
+    </style>
+  </head>
+  <body>
+    <h1>Bridge fixture</h1>
+    <p id="intro">A page the end-to-end test can drive without touching the network.</p>
+
+    <form id="form">
+      <label for="name">Your name</label>
+      <input id="name" name="name" type="text" placeholder="type here" />
+      <label for="bio">Bio</label>
+      <textarea id="bio" name="bio" rows="2"></textarea>
+      <label><input id="agree" type="checkbox" /> I agree</label>
+      <button id="submit" type="submit">Send</button>
+    </form>
+    <p id="result">idle</p>
+
+    <div id="late"></div>
+    <button id="spawn" type="button">Spawn</button>
+
+    <a id="link" href="https://example.com/">Example link</a>
+    <div id="tall"></div>
+    <p id="bottom">bottom of the page</p>
+
+    <script>
+      const result = document.getElementById('result')
+      document.getElementById('form').addEventListener('submit', (event) => {
+        event.preventDefault()
+        const name = document.getElementById('name').value
+        result.textContent = `submitted:${name}`
+      })
+      document.getElementById('spawn').addEventListener('click', () => {
+        setTimeout(() => {
+          const node = document.createElement('p')
+          node.id = 'spawned'
+          node.textContent = 'spawned later'
+          document.getElementById('late').append(node)
+        }, 700)
+      })
+    </script>
+  </body>
+</html>

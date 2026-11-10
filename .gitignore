@@ -1,0 +1,16 @@
+# 实验与设计验证用的脚本、截图、日志：留下结论，不留下过程
+/spike/
+
+# 编译产物：机器上第一次用到时会从 axdriver.swift 现编
+/mac/axdriver
+*.mc/
+
+# 测试跑出来的证据
+/test/probe-events.log
+/test/probe-geometry.json
+/test/probe-cursor.png
+
+# 依赖与本地工具链状态
+node_modules/
+.DS_Store
+*.log

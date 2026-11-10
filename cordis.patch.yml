@@ -1,0 +1,17 @@
+# Chrome tab bridge layer for the dsh profile.
+#
+# Adds an `@` reference source that lists the tabs of the user's own Chrome
+# window, plus a small set of `chrome_*` tools that read and drive whichever
+# tab the user last mentioned.
+#
+# The companion MV3 extension is shipped inside this package under
+# `extension/`; the host unpacks it to ~/.dsh/chrome-tab-extension and serves
+# a fixed-port discovery beacon so the extension needs no manual port entry.
+
+- insert:
+    - id: chrome-tab
+      name: 'dsh-chrome-tab'
+      config:
+        snapshotMaxChars: 20000
+        maxInteractiveItems: 60
+        toolTimeoutMs: 60000
