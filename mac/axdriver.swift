@@ -639,7 +639,6 @@ func handle(_ req: [String: Any]) {
         guard let ctx = findWebContext(titleHint: p["title"] as? String) else {
             fail(id, "找不到 Chrome 网页窗口", code: "no-window"); return
         }
-        limitCursor(to: ctx)
         let nodes = collectNodes(ctx.webArea, maxNodes: (p["max"] as? Int) ?? 3000)
         let maxOut = (p["limit"] as? Int) ?? 200
         let list: [[String: Any]] = nodes.prefix(maxOut).map { n in
@@ -662,12 +661,10 @@ func handle(_ req: [String: Any]) {
         guard let ctx = findWebContext(titleHint: p["title"] as? String) else {
             fail(id, "找不到 Chrome 网页窗口", code: "no-window"); return
         }
-        limitCursor(to: ctx)
         let nodes = collectNodes(ctx.webArea)
         guard let node = resolve(nodes, params: p) else {
             fail(id, "没有匹配的元素：\(p["name"] ?? p["index"] ?? "?")", code: "no-match"); return
         }
-        withCursor { Cursor.shared.click(at: CGPoint(x: node.frame.midX, y: node.frame.midY)) }
         let (ok, detail) = driver.press(node)
         if ok {
             reply(id, ["element": describe(node), "detail": detail,
@@ -689,9 +686,6 @@ func handle(_ req: [String: Any]) {
                 fail(id, "没有匹配的输入元素：\(p["name"] ?? "?")", code: "no-match"); return
             }
             node = n
-        }
-        if let target = node {
-            withCursor { Cursor.shared.click(at: CGPoint(x: target.frame.midX, y: target.frame.midY)) }
         }
         var steps: [String] = []
         if p["replace"] as? Bool == true, let target = node {
@@ -716,7 +710,6 @@ func handle(_ req: [String: Any]) {
         guard let ctx = findWebContext(titleHint: p["title"] as? String) else {
             fail(id, "找不到 Chrome 网页窗口", code: "no-window"); return
         }
-        limitCursor(to: ctx)
         let point = CGPoint(x: gx, y: gy)
         let nodes = collectNodes(ctx.webArea)
         guard let (node, how) = pressTarget(in: nodes, at: point) else {
@@ -726,7 +719,6 @@ func handle(_ req: [String: Any]) {
             fail(id, "命中 \(describe(node))，但该元素没有 AXPress 能力", code: "no-press"); return
         }
         // 指针落到用户点的那个位置：clickAt 里命中元素可能是个大容器，滑到容器中心会很怪。
-        withCursor { Cursor.shared.click(at: point) }
         let (pressed, detail) = driver.press(node)
         if pressed {
             reply(id, ["element": describe(node), "how": how, "detail": detail, "index": node.index,
@@ -742,13 +734,11 @@ func handle(_ req: [String: Any]) {
         guard let ctx = findWebContext(titleHint: p["title"] as? String) else {
             fail(id, "找不到 Chrome 网页窗口", code: "no-window"); return
         }
-        limitCursor(to: ctx)
         ensureMain(ctx)
         let nodes = collectNodes(ctx.webArea)
         guard let (node, how) = focusTarget(in: nodes, at: CGPoint(x: gx, y: gy)) else {
             fail(id, "坐标 (\(gx),\(gy)) 处没有可聚焦的 AX 元素", code: "no-hit"); return
         }
-        withCursor { Cursor.shared.click(at: CGPoint(x: gx, y: gy)) }
         var steps: [String] = []
         if p["replace"] as? Bool == true {
             let (fok, fdetail) = driver.focusOnly(node)
@@ -798,12 +788,10 @@ func handle(_ req: [String: Any]) {
         if let f = p["from"] as? [Double], f.count == 2 { from = CGPoint(x: f[0], y: f[1]) }
         if let t = p["to"] as? [Double], t.count == 2 { to = CGPoint(x: t[0], y: t[1]) }
         let needsNodes = p["fromName"] != nil || p["toName"] != nil || p["index"] != nil
-        var dragContext: WebContext?
         if needsNodes {
             guard let ctx = findWebContext(titleHint: p["title"] as? String) else {
                 fail(id, "找不到 Chrome 网页窗口", code: "no-window"); return
             }
-            dragContext = ctx
             ensureMain(ctx)
             let nodes = collectNodes(ctx.webArea)
             var anchorParams: [String: Any] = [:]
@@ -835,19 +823,7 @@ func handle(_ req: [String: Any]) {
         start = CGPoint(x: start.x.rounded(), y: start.y.rounded())
         end = CGPoint(x: end.x.rounded(), y: end.y.rounded())
         let steps = (p["steps"] as? Int) ?? 14
-        var followed = 0
-        let (ok, detail) = driver.drag(from: start, to: end, steps: steps) { point, index in
-            if cursorOff { return }
-            if index == 0 {
-                // 拖拽会先把 Chrome 提到前面，此刻才知道指针该不该画。
-                if let ctx = dragContext { limitCursor(to: ctx) }
-                withCursor { Cursor.shared.hold(at: point) }
-            } else if index < steps {
-                withCursor { Cursor.shared.follow(point) }
-            }
-            followed = index
-        }
-        if followed > 0 { withCursor { Cursor.shared.release() } }
+        let (ok, detail) = driver.drag(from: start, to: end, steps: steps)
         ok ? reply(id, ["detail": detail, "from": [start.x, start.y], "to": [end.x, end.y]])
            : fail(id, detail)
 
@@ -855,7 +831,6 @@ func handle(_ req: [String: Any]) {
         guard let ctx = findWebContext(titleHint: p["title"] as? String) else {
             fail(id, "找不到 Chrome 网页窗口", code: "no-window"); return
         }
-        limitCursor(to: ctx)
         if let name = p["name"] as? String {
             let nodes = collectNodes(ctx.webArea)
             guard let n = resolve(nodes, params: ["name": name]) else {
@@ -879,7 +854,6 @@ func handle(_ req: [String: Any]) {
         guard let ctx = findWebContext(titleHint: p["title"] as? String) else {
             fail(id, "找不到 Chrome 网页窗口", code: "no-window"); return
         }
-        limitCursor(to: ctx)
         reply(id, ["origin": [ctx.origin.x, ctx.origin.y],
                    "size": [ctx.size.width, ctx.size.height],
                    "windowFrame": frameOf(ctx.window).map { [$0.origin.x, $0.origin.y, $0.width, $0.height] } as Any])
@@ -917,291 +891,20 @@ let keyCodes: [String: CGKeyCode] = [
     "o": 31, "u": 32, "i": 34, "p": 35, "l": 37, "j": 38, "k": 40, "n": 45, "m": 46,
 ]
 
-// MARK: - 虚拟光标
-//
-// AXPress 和 postToPid 都不碰真实光标，所以用户看不见"刚刚点在哪"。这里在屏幕上叠一个
-// 总在最前、鼠标穿透的小箭头：每次操作先滑到目标，再点一下，动作就看得见了。
-//
-// AppKit 的窗口只有在一个跑着的 RunLoop 里才会被 WindowServer 合成（只调 orderFront 会
-// 得到 isVisible=true 但 occlusionState 不可见的空窗口）。因此主线程跑 NSApplication.run()，
-// 命令循环搬到后台队列，动画通过 DispatchQueue.main.sync 回到主线程执行。
-
-let cursorOff = ProcessInfo.processInfo.environment["AXDRIVER_CURSOR"] == "off"
-let cursorPace = max(0.2, min(4.0, Double(ProcessInfo.processInfo.environment["AXDRIVER_CURSOR_SPEED"] ?? "") ?? 1))
-
-final class PointerView: NSView {
-    static let windowSize = NSSize(width: 44, height: 56)
-    static let tip = CGPoint(x: 10, y: 40)   // 尖端在窗口内的 Cocoa 坐标
-
-    var pressed = false { didSet { needsDisplay = true } }
-    var ripple: CGFloat? { didSet { needsDisplay = true } }
-
-    override var isOpaque: Bool { false }
-
-    override func draw(_ dirtyRect: NSRect) {
-        let tip = PointerView.tip
-
-        if let progress = ripple {
-            let radius = 7 + 22 * progress
-            let ring = NSBezierPath(ovalIn: NSRect(x: tip.x - radius, y: tip.y - radius,
-                                                   width: radius * 2, height: radius * 2))
-            NSColor(red: 0.15, green: 0.55, blue: 1, alpha: 0.5 * (1 - progress)).setStroke()
-            ring.lineWidth = 2.5
-            ring.stroke()
-        }
-
-        let scale: CGFloat = pressed ? 0.86 : 1
-        let offsets: [(CGFloat, CGFloat)] = [(0, 0), (0, -18), (10.5, -13), (13, -21),
-                                            (15.5, -20), (13, -12), (19, -12)]
-        let path = NSBezierPath()
-        for (i, o) in offsets.enumerated() {
-            let q = NSPoint(x: tip.x + o.0 * scale, y: tip.y + o.1 * scale)
-            if i == 0 { path.move(to: q) } else { path.line(to: q) }
-        }
-        path.close()
-
-        // 浅色描边 + 柔和阴影：深色网页上靠白边分辨，浅色网页上靠灰影分辨。
-        NSGraphicsContext.saveGraphicsState()
-        let shade = NSShadow()
-        shade.shadowColor = NSColor(white: 0, alpha: 0.38)
-        shade.shadowBlurRadius = 6
-        shade.shadowOffset = NSSize(width: 0, height: -0.5)
-        shade.set()
-        NSColor(white: 1, alpha: 0.94).setStroke()
-        path.lineWidth = 4
-        path.stroke()
-        NSGraphicsContext.restoreGraphicsState()
-
-        NSColor(white: 0.09, alpha: 0.88).setFill()
-        path.fill()
-        NSColor(white: 1, alpha: 0.98).setStroke()
-        path.lineWidth = 1.4
-        path.stroke()
-    }
-}
-
-final class Cursor {
-    static let shared = Cursor()
-
-    private var panel: NSPanel?
-    private var view: PointerView?
-    private var point = CGPoint(x: 0, y: 0)     // AX 全局坐标（屏幕左上原点，y 向下）
-    private var shown = false
-    private var bounds: CGRect?                 // Chrome 窗口矩形（AX 坐标）：光标只在这块地方出现
-    private var suppressed = false               // Chrome 不在前台：这段时间根本不画
-    private var chromePid: pid_t?               // 最近一次操作时 Chrome 的 pid，用来发现用户切走了
-    private var bobTimer: Timer?                // 空闲时的轻微浮动
-    private var bobPhase: CGFloat = 0
-
-    /// 光标只是 Chrome 的指示器，不该画到别的应用上。给定窗口矩形后，落在外面的位置一律不显示。
-    /// 还要内缩，让整个光标窗口都待在 Chrome 里，而不是从左上角溢出去。
-    func limit(to chrome: CGRect?, show: Bool = true) {
-        // show == false：Chrome 不是前台应用，指针不该浮到别的窗口上去。
-        suppressed = !show
-        if show { chromePid = driver.currentPid }
-        guard let chrome, show, chrome.width > 160, chrome.height > 160 else {
-            bounds = nil
-            panel?.orderOut(nil)
-            return
-        }
-        bounds = CGRect(x: chrome.minX + PointerView.tip.x + 2,
-                        y: chrome.minY + PointerView.tip.y + 2,
-                        width: max(0, chrome.width - PointerView.tip.x - PointerView.windowSize.width + PointerView.tip.x - 2),
-                        height: max(0, chrome.height - PointerView.tip.y - PointerView.windowSize.height + PointerView.tip.y - 2))
-        if let panel, bounds?.contains(point) != true { panel.orderOut(nil) }
-    }
-
-    private func allowed(_ p: CGPoint) -> Bool {
-        if suppressed { return false }
-        guard let bounds else { return true }
-        return bounds.contains(p)
-    }
-
-    /// AX 坐标是主屏左上原点、y 向下；Cocoa 窗口是主屏左下原点、y 向上。
-    private func cocoaOrigin(_ p: CGPoint) -> NSPoint {
-        let height = NSScreen.screens.first?.frame.height ?? 0
-        return NSPoint(x: p.x - PointerView.tip.x, y: (height - p.y) - PointerView.tip.y)
-    }
-
-    private func ensure() {
-        guard panel == nil else { return }
-        let panel = NSPanel(contentRect: NSRect(origin: .zero, size: PointerView.windowSize),
-                            styleMask: [.borderless, .nonactivatingPanel],
-                            backing: .buffered, defer: false)
-        panel.level = .screenSaver
-        panel.isOpaque = false
-        panel.backgroundColor = .clear
-        panel.hasShadow = false
-        panel.ignoresMouseEvents = true
-        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
-        panel.isReleasedWhenClosed = false
-        let view = PointerView(frame: NSRect(origin: .zero, size: PointerView.windowSize))
-        panel.contentView = view
-        panel.orderFrontRegardless()
-        self.panel = panel
-        self.view = view
-    }
-
-    private func place(_ p: CGPoint) {
-        ensure()
-        point = p
-        guard let panel else { return }
-        guard allowed(p) else {
-            if panel.isVisible { panel.orderOut(nil) }
-            return
-        }
-        if !panel.isVisible { panel.orderFrontRegardless() }
-        panel.setFrameOrigin(cocoaOrigin(p))
-        panel.displayIfNeeded()
-    }
-
-    /// 只在原地做亚像素级别的呼吸浮动，不改 point（那是「真实」落点）。
-    private func bobTick() {
-        guard let panel, panel.isVisible, !suppressed, allowed(point) else { return }
-        // 用户切到别的应用时把指针收起来。
-        if let pid = chromePid, NSWorkspace.shared.frontmostApplication?.processIdentifier != pid {
-            panel.orderOut(nil)
-            return
-        }
-        bobPhase += 0.055
-        let dx = sin(bobPhase) * 1.5
-        let dy = cos(bobPhase * 0.8) * 1.1
-        panel.setFrameOrigin(cocoaOrigin(CGPoint(x: point.x + dx, y: point.y + dy)))
-    }
-
-    /// 命令跑完了：指针留在原地轻轻浮动，等下一条命令。
-    func rest() {
-        guard !cursorOff, shown, allowed(point) else { return }
-        guard bobTimer == nil else { return }
-        let timer = Timer(timeInterval: 1.0 / 45.0, repeats: true) { [weak self] _ in self?.bobTick() }
-        RunLoop.main.add(timer, forMode: .common)
-        bobTimer = timer
-    }
-
-    /// 新命令开始：停止浮动，指针回到准确落点。
-    func wake() {
-        bobTimer?.invalidate()
-        bobTimer = nil
-        bobPhase = 0
-        guard shown, allowed(point) else { return }
-        panel?.setFrameOrigin(cocoaOrigin(point))
-    }
-
-    private func pump(_ seconds: TimeInterval) {
-        RunLoop.main.run(until: Date().addingTimeInterval(seconds))
-    }
-
-    func glide(to target: CGPoint, duration: TimeInterval = 0.26) {
-        ensure()
-        let entry = CGPoint(x: target.x - 70, y: target.y - 46)
-        let from = shown && allowed(point) ? point : entry
-        if !shown || !allowed(point) {
-            place(from)
-            pump(0.02)
-        }
-        let frames = max(5, Int(duration * 60 * Double(cursorPace)))
-        let step = duration / Double(frames)
-        for i in 1...frames {
-            let f = Double(i) / Double(frames)
-            let e = 1 - pow(1 - f, 3)
-            place(CGPoint(x: from.x + (target.x - from.x) * e, y: from.y + (target.y - from.y) * e))
-            pump(step)
-        }
-        place(target)
-        shown = true
-    }
-
-    func settle(_ pressed: Bool, for duration: TimeInterval = 0.07) {
-        view?.pressed = pressed
-        pump(duration)
-    }
-
-    func pulse() {
-        guard let view = view else { return }
-        let frames = max(6, Int(0.28 * 60 * Double(cursorPace)))
-        let step = 0.28 / Double(frames)
-        for i in 1...frames {
-            view.ripple = CGFloat(i) / CGFloat(frames)
-            pump(step)
-        }
-        view.ripple = nil
-    }
-
-    func click(at target: CGPoint) {
-        glide(to: target)
-        settle(true)
-        settle(false)
-        pulse()
-    }
-
-    func hold(at target: CGPoint) {
-        glide(to: target)
-        settle(true)
-    }
-
-    func follow(_ p: CGPoint) {
-        place(p)
-    }
-
-    func release() {
-        settle(false)
-    }
-
-    func hide() {
-        bobTimer?.invalidate()
-        bobTimer = nil
-        panel?.orderOut(nil)
-        shown = false
-    }
-}
-
-/// 光标动画必须在主线程跑，命令本身在后台队列。
-func withCursor(_ body: () -> Void) {
-    guard !cursorOff else { return }
-    if Thread.isMainThread {
-        Cursor.shared.wake()   // 新动作开始，先把浮动停掉
-        body()
-    } else {
-        DispatchQueue.main.sync {
-            Cursor.shared.wake()
-            body()
-        }
-    }
-}
-
-/// 光标只在当前 Chrome 窗口里出现：别的应用不该看到这个指针。
-func limitCursor(to ctx: WebContext) {
-    guard !cursorOff else { return }
-    let rect = frameOf(ctx.window)
-    // 只有 Chrome 在最前面时才画：否则 Chrome 被别的窗口盖着，指针会飘在人家脸上。
-    let front = NSWorkspace.shared.frontmostApplication?.processIdentifier
-    let show = front != nil && front == driver.currentPid
-    DispatchQueue.main.sync { Cursor.shared.limit(to: rect, show: show) }
-}
-
 // MARK: - 主循环
 
 setvbuf(stdout, nil, _IOLBF, 0)
 emit(["ready": true, "pid": Int(ProcessInfo.processInfo.processIdentifier),
       "axTrusted": AXIsProcessTrusted(), "version": "0.1.0"])
 
-let app = NSApplication.shared
-app.setActivationPolicy(.accessory)
-
-DispatchQueue.global(qos: .userInitiated).async {
-    while let line = readLine(strippingNewline: true) {
-        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { continue }
-        guard let data = trimmed.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            fail(nil, "无法解析的 JSON", code: "bad-json")
-            continue
-        }
-        handle(obj)
-        // 命令结束：指针留在原地轻微浮动，等下一条命令。
-        DispatchQueue.main.async { Cursor.shared.rest() }
+while let line = readLine(strippingNewline: true) {
+    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.isEmpty { continue }
+    guard let data = trimmed.data(using: .utf8),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        fail(nil, "无法解析的 JSON", code: "bad-json")
+        continue
     }
-    exit(0)
+    handle(obj)
 }
-
-app.run()
+exit(0)

@@ -56,12 +56,14 @@ The extension needs no port: it probes `30795`–`30805` every 30 seconds and at
 
 The `debugger` permission comes with the extension — Chrome shows no extra prompt. After you edit anything under `extension/`, click the extension's reload icon on `chrome://extensions` for it to take effect.
 
-The native channel needs two things, both on macOS:
+The native channel exists only on macOS and needs two things:
 
 - **Accessibility permission**: System Settings → Privacy & Security → Accessibility, and tick the app running DSH (the terminal, if you launch it from a shell)
 - **Xcode command line tools**: `xcode-select --install`. On first use the plugin compiles `mac/axdriver.swift` to `~/.dsh/chrome-tab-native/axdriver` and reuses it while the source is unchanged; a prebuilt `mac/axdriver` inside the plugin directory is used as is
 
-> These two only affect name-based targeting. Without them the plugin still works — the CDP channel does not need them — and results state which channel was used instead of pretending otherwise.
+> These two only affect the native channel. Without them the plugin still works — the CDP channel does not need them — and results state which channel was used instead of pretending otherwise.
+>
+> **Windows and Linux have no native channel and need neither.** There the CDP channel handles every click, keystroke, drag and scroll.
 
 ### Verify
 
@@ -111,12 +113,12 @@ Each action tries three channels in order and stops at the first success:
 | # | Channel | Where the event comes from | Requires |
 | --- | --- | --- | --- |
 | 1 | CDP | The browser's own input pipeline: `Input.dispatchMouseEvent` / `dispatchKeyEvent` / `insertText` | The extension's `debugger` permission |
-| 2 | Native | macOS process-level delivery: AX `AXPress`, `CGEvent.postToPid`, a global tap | Accessibility permission + a compiler |
+| 2 | Native | macOS process-level delivery: AX `AXPress`, `CGEvent.postToPid`, a global tap | macOS only + Accessibility permission + a compiler |
 | 3 | Synthetic | `dispatchEvent` inside the page | Nothing |
 
 **CDP is the main path.** The event sequence matches a real click (`pointerover → pointermove → pointerdown → mousedown(buttons=1, detail=1) → pointerup → mouseup → click`), it works while Chrome is in the background, it never switches your tab, and the system pointer does not move — press, move and release all happen inside the browser.
 
-**The native channel covers** what CDP cannot reach: targeting by name, scrolling an element into view by name, and pages where debugging is blocked.
+**The native channel covers** what CDP cannot reach: semantics that only live in the accessibility tree (scrolling an element into view by name) and pages where debugging is blocked. Clicking and typing by name now go through CDP first — the page is scored on `aria-label`, placeholder and visible text, and the resulting point is clicked for real — so they work on Windows too and draw the same pointer.
 
 | Native operation | Implementation | Trusted | Moves the system pointer | Needs Chrome in front |
 | --- | --- | --- | --- | --- |
@@ -131,13 +133,13 @@ Drag is the one case that cannot avoid global events: a press delivered through 
 
 **The synthetic channel is only a fallback.** Results say `synthetic` outright instead of pretending otherwise.
 
-> Name-based actions bring the tab to the front — Chrome only exposes the accessibility tree of the active tab. Actions by `index` or coordinate go over CDP and leave your front window alone.
+> Name-based actions bring the tab to the front only when CDP cannot find the name either, because Chrome only exposes the accessibility tree of the active tab. Actions by `index` or coordinate go over CDP and leave your front window alone.
 
 ## The pointer on the page
 
 Every action draws a pointer on the page: it glides to the target, presses (darkens with a ripple), and releases, then stays there bobbing gently.
 
-It is a DOM element (`#__dsh_ai_cursor`), not the system cursor:
+It is a DOM element (`#__dsh_ai_cursor`), not the system cursor. The plugin stacks no window on your screen and never moves the real pointer for you:
 
 - `position: fixed`, `pointer-events: none`, `z-index: 2147483647`
 - It lives inside the page, so code checking `isTrusted` never sees it and `document.elementFromPoint` never hits it
@@ -230,7 +232,7 @@ Other cases:
 
 **Top-level document only.** Injection does not set `allFrames`, so elements inside cross-origin iframes are out of reach. `chrome_query` can still inspect a same-origin iframe, but click coordinates are relative to the top-level viewport.
 
-**Name-based actions switch tabs.** Chrome only exposes the active tab's accessibility tree, so targeting by `name` has to bring it forward. Actions by `index` or coordinate use CDP and leave your front window untouched.
+**Name-based actions switch tabs only as a fallback.** When CDP cannot find the name either, the lookup falls back to the accessibility tree, and Chrome only exposes that for the tab it is showing — which brings it forward. Actions by `index` or coordinate never do.
 
 **Native drag moves the real pointer.** It is restored afterwards. Drag over CDP does not move it.
 

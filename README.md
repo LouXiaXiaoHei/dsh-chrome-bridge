@@ -56,12 +56,14 @@ dsh plugin --profile desktop add link:/path/to/dsh-chrome-bridge
 
 `debugger` 权限在加载扩展时一并通过，Chrome 不会额外弹窗。改过 `extension/` 里的代码之后，要回 `chrome://extensions` 点一次扩展的刷新图标才会生效。
 
-原生通道需要两样东西，都在 macOS 上：
+原生通道只在 macOS 上存在，需要两样东西：
 
 - **辅助功能授权**：系统设置 → 隐私与安全性 → 辅助功能，勾选运行 DSH 的那个 App（在终端里跑就是终端）
 - **Xcode 命令行工具**：`xcode-select --install`。插件首次用到时把 `mac/axdriver.swift` 编译到 `~/.dsh/chrome-tab-native/axdriver`，源码没变就复用；插件目录里若有预编译好的 `mac/axdriver` 则直接用
 
-> 这两样只影响「按名字操作」。没有也能用，CDP 通道不需要它们；工具会明确说退回了哪条路，不会假装成功。
+> 这两样只影响原生通道。没有也能用，CDP 通道不需要它们；工具会明确说退回了哪条路，不会假装成功。
+>
+> **Windows 和 Linux 上没有原生通道，也不需要这两样东西。** CDP 通道在那边承担全部点击、输入、拖拽与滚动。
 
 ### 验证
 
@@ -111,12 +113,12 @@ chrome_scroll { name: "页脚" }
 | 顺序 | 通道 | 事件由谁产生 | 前提 |
 | --- | --- | --- | --- |
 | 1 | CDP | 浏览器输入管线：`Input.dispatchMouseEvent` / `dispatchKeyEvent` / `insertText` | 扩展的 `debugger` 权限 |
-| 2 | 原生 | macOS 进程级投递：AX `AXPress`、`CGEvent.postToPid`、全局 tap | 辅助功能授权 + 编译器 |
+| 2 | 原生 | macOS 进程级投递：AX `AXPress`、`CGEvent.postToPid`、全局 tap | 仅 macOS + 辅助功能授权 + 编译器 |
 | 3 | 合成 | 页面内 `dispatchEvent` | 无 |
 
 **CDP 是主干。** 事件序列与真人一致（`pointerover → pointermove → pointerdown → mousedown(buttons=1, detail=1) → pointerup → mouseup → click`），不需要 Chrome 在前台，也不切换你的标签页，系统鼠标一动不动——按下、移动、抬起全在浏览器内部完成。
 
-**原生通道补位** CDP 够不着的地方：按名字定位元素、按名字滚动到某个元素、以及页面禁止调试的场合。
+**原生通道补位** CDP 够不着的地方：无障碍树里才有的语义（按名字滚动到某个元素）、以及页面禁止调试的场合。按名字点击与输入现在也先走 CDP——在页面里按 aria-label、placeholder、可见文字打分定位，拿到点再真点击，所以 Windows 上一样能用，也一样会画出指针。
 
 | 原生通道的操作 | 实现 | 事件可信 | 碰系统光标 | 需要 Chrome 在前台 |
 | --- | --- | --- | --- | --- |
@@ -131,13 +133,13 @@ chrome_scroll { name: "页脚" }
 
 **合成通道只是兜底**，返回值里会明写 `synthetic`，不会假装成功。
 
-> 按名字操作会把标签页切到前台——Chrome 只对当前标签页暴露无障碍树。按 `index` 或坐标走 CDP，不动你的前台窗口。
+> 只有当 CDP 也找不到那个名字、退回无障碍树时，才会把标签页切到前台——Chrome 只对当前标签页暴露无障碍树。
 
 ## 页面上那只指针
 
 每次操作都会在页面上画一个指针：滑到目标、按下（压暗 + 涟漪）、松手，松开后留在原地轻轻浮动。
 
-它是页面里的一个 DOM 元素 `#__dsh_ai_cursor`，不是系统光标：
+它是页面里的一个 DOM 元素 `#__dsh_ai_cursor`，不是系统光标。插件不往屏幕上叠任何窗口，系统那只大箭头不会替你动：
 
 - `position: fixed`、`pointer-events: none`、`z-index: 2147483647`
 - 长在网页里，所以校验 `isTrusted` 的代码看不到它，`document.elementFromPoint` 也不会命中它

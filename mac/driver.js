@@ -26,12 +26,12 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
-export const AXDRIVER_PATH = join(HERE, 'axdriver')
+export const AXDRIVER_PATH = join(HERE, process.platform === 'win32' ? 'axdriver.exe' : 'axdriver')
 export const AXDRIVER_SOURCE = join(HERE, 'axdriver.swift')
 
 /** 没编译过时，二进制与编译缓存放这里，避免写进插件安装目录。 */
 const CACHE_DIR = join(homedir(), '.dsh', 'chrome-tab-native')
-const CACHED_BINARY = join(CACHE_DIR, 'axdriver')
+const CACHED_BINARY = join(CACHE_DIR, process.platform === 'win32' ? 'axdriver.exe' : 'axdriver')
 
 /** 单个命令的默认超时。拖拽会分很多步，给得宽一些。 */
 const DEFAULT_TIMEOUT_MS = 20000
@@ -47,7 +47,10 @@ let compileError
  * 只做 mtime 比较，源码没变就直接复用。
  */
 export async function ensureDriver({ logger } = {}) {
-  if (process.platform !== 'darwin') throw new Error(`原生驱动只支持 macOS（当前 ${process.platform}）`)
+  if (process.platform !== 'darwin') {
+    throw new Error(`原生输入通道只在 macOS 上存在（当前系统是 ${process.platform}）；`
+      + '点击、输入、拖拽、滚动请走 CDP 通道，那边 Windows 和 Linux 都能用。')
+  }
   if (existsSync(AXDRIVER_PATH)) return AXDRIVER_PATH
   if (compileError !== undefined) throw compileError
   if (compiled !== undefined) return compiled
@@ -120,7 +123,7 @@ export class AxDriver {
     if (this.#ready) return this.#ready
     if (!AxDriver.available()) {
       return Promise.reject(new Error(
-        `macOS 原生输入驱动不可用：既没有 ${AXDRIVER_PATH}，也没有 ${AXDRIVER_SOURCE}。`,
+        `原生输入驱动只在 macOS 上可用，而且需要 ${AXDRIVER_PATH} 或 ${AXDRIVER_SOURCE}。`,
       ))
     }
     this.#ready = (async () => {
@@ -270,7 +273,7 @@ export async function probeNative(logger) {
       chrome: false,
       error: process.platform === 'darwin'
         ? `缺少驱动源码：${AXDRIVER_SOURCE}`
-        : `原生驱动只支持 macOS（当前 ${process.platform}）`,
+        : `原生输入通道只在 macOS 上存在（当前系统是 ${process.platform}），这里只有 CDP 通道可用`,
     }
   }
   const driver = new AxDriver({ logger })

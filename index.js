@@ -232,7 +232,7 @@ export function apply(ctx, config) {
         native.state = 'unavailable'
         native.reason = process.platform === 'darwin'
           ? `原生驱动不可用：${join(fileURLToPath(new URL('./mac/', import.meta.url)))} 下缺少 axdriver.swift`
-          : `原生驱动只支持 macOS（当前 ${process.platform}）`
+          : `原生输入通道只在 macOS 上存在（当前系统是 ${process.platform}），这里只有 CDP 通道可用`
         return undefined
       }
       const driver = new AxDriver({ logger })
@@ -323,34 +323,6 @@ export function apply(ctx, config) {
     }
   }
 
-  /**
-   * Run one native input, falling back to the extension when the native channel
-   * cannot do it.
-   *
-   * The fallback matters: an element with no AXPress action (a canvas, a custom
-   * div) is still clickable in reality, and a synthetic click is better than an
-   * error even though a strict page could tell the difference. The result says
-   * which path ran so the model — and the user reading the transcript — can see
-   * when a click was not fully faithful.
-   */
-  const tryNative = async (work, fallback) => {
-    const driver = await nativeDriver()
-    if (driver === undefined) {
-      const result = await fallback(undefined)
-      return { ...result, native: false, why: native.reason }
-    }
-    try {
-      const result = await work(driver)
-      return { ...result, native: true }
-    } catch (error) {
-      if (fallback === undefined) throw error
-      // fallback 收到原始错误：活儿真干了但没成，跟"这台机器没这条通道"是两回事。
-      const result = await fallback(error)
-      return { ...result, native: false, why: error.message }
-    }
-  }
-
-
   // ------------------------------------------------------------ CDP channel
   // The extension attaches to the tab through chrome.debugger and sends real
   // Input.* commands. Events produced this way are isTrusted — the browser's own
@@ -417,6 +389,65 @@ export function apply(ctx, config) {
       return { key: lower, code: `Digit${lower}`, windowsVirtualKeyCode: lower.charCodeAt(0) }
     }
     return { key, code: key, windowsVirtualKeyCode: 0 }
+  }
+
+  /**
+   * Find an element by the words a person would use, then hand back a point on it.
+   *
+   * This is the same idea as the accessibility lookup, but it runs inside the page through
+   * Runtime.evaluate, so it works on every platform and it needs no native helper. It also
+   * puts the pointer exactly where the user would click, which is what makes the on-screen
+   * cursor land on the element rather than on whatever container swallowed the hit test.
+   */
+  const cdpLocate = async (tabId, name) => {
+    const expression = `(() => {
+      const needle = ${'${JSON.stringify(name)}'}.trim().toLowerCase();
+      const nodes = [...document.querySelectorAll('a,button,input,textarea,select,summary,label,[role],[contenteditable],[tabindex],[aria-label],[title],[placeholder]')];
+      const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+      const box = (el) => el.getBoundingClientRect();
+      const score = (el) => {
+        const candidates = [
+          el.getAttribute('aria-label'), el.getAttribute('title'), el.getAttribute('placeholder'),
+          el.getAttribute('name'), typeof el.value === 'string' ? el.value : '', textOf(el),
+        ].map((v) => (v || '').trim()).filter(Boolean);
+        let best = 0;
+        for (const raw of candidates) {
+          const low = raw.toLowerCase();
+          if (low === needle) best = Math.max(best, 100);
+          else if (low.startsWith(needle)) best = Math.max(best, 86);
+          else if (low.includes(needle)) best = Math.max(best, 70);
+          else if (low.length > 1 && needle.includes(low)) best = Math.max(best, 40);
+        }
+        return best;
+      };
+      let hit = null;
+      let best = 0;
+      for (const el of nodes) {
+        const r = box(el);
+        if (r.width < 2 || r.height < 2) continue;
+        const s = score(el);
+        if (s > best) { best = s; hit = el; }
+      }
+      if (hit === null) return JSON.stringify({ error: 'no-match' });
+      hit.scrollIntoView({ block: 'center', inline: 'nearest' });
+      const r = box(hit);
+      if (r.width < 2 || r.height < 2) return JSON.stringify({ error: 'not-visible' });
+      const label = (hit.getAttribute('aria-label') || hit.getAttribute('placeholder') || hit.getAttribute('title') || textOf(hit) || hit.tagName).replace(/\\s+/g, ' ').trim().slice(0, 48);
+      return JSON.stringify({ x: r.left + r.width / 2, y: r.top + r.height / 2, tag: hit.tagName.toLowerCase(), label });
+    })()`
+    const { results } = await cdp(tabId, [{
+      method: 'Runtime.evaluate',
+      params: { expression, returnByValue: true, awaitPromise: false },
+    }])
+    let hit
+    try {
+      hit = JSON.parse(String(results?.[0]?.result?.value ?? ''))
+    } catch {
+      throw new Error(`没能在页面里定位 "${name}"`)
+    }
+    if (hit?.error === 'no-match') throw new Error(`页面上没有匹配 "${name}" 的元素`)
+    if (hit?.error !== undefined) throw new Error(`"${name}" 现在不可见`)
+    return hit
   }
 
   /** Type text as keyboard events: printable ASCII carries its own key code, everything else goes in as text. */
@@ -755,21 +786,30 @@ export function apply(ctx, config) {
       const tabId = await resolveTab(args?.tabId)
 
       if (!byIndex) {
-        // The accessibility tree only exposes the tab Chrome is showing, so a name
-        // lookup does have to bring the tab forward. Index and coordinate clicks
-        // go through CDP and leave the user's foreground alone.
-        const outcome = await tryNative(
-          async (driver) => {
-            const tab = await focusableTab(tabId)
-            return driver.call('click', { name, title: tab.title })
+        const outcome = await runChannels([
+          {
+            name: 'cdp',
+            run: async () => {
+              const hit = await cdpLocate(tabId, name)
+              await cdpClick(tabId, hit.x, hit.y)
+              return { element: hit.tag, label: hit.label }
+            },
           },
-          async (error) => {
-            if (error !== undefined) throw error
-            throw new Error(`按名字点击需要原生通道（${native.reason}）；改用 chrome_snapshot 的 index`)
+          {
+            name: 'native',
+            run: async () => {
+              // The accessibility tree only exposes the tab Chrome is showing.
+              const driver = await requireDriver()
+              const tab = await focusableTab(tabId)
+              return driver.call('click', { name, title: tab.title })
+            },
           },
-        )
-        const role = String(outcome.element ?? '').split(' ')[0] || 'element'
-        return { text: `Clicked "${name}" (${role}) via the native accessibility press.` }
+        ])
+        const value = outcome.value ?? {}
+        const role = outcome.channel === 'native'
+          ? (String(value.element ?? '').split(' ')[0] || 'element')
+          : (value.element ?? 'element')
+        return { text: `Clicked "${name}" (${role}) via the trusted ${outcome.channel} input channel.` }
       }
 
       const target = await call('page.targetBox', { tabId, index })
@@ -975,29 +1015,35 @@ export function apply(ctx, config) {
       const tabId = await resolveTab(args?.tabId)
 
       if (!byIndex) {
-        const outcome = await tryNative(
-          async (driver) => {
-            const tab = await focusableTab(tabId)
-            return driver.call('type', { name, text: value, replace: args?.replace === true, title: tab.title })
-          },
-          async (error) => {
-            if (error !== undefined) throw error
-            throw new Error(`按名字输入需要原生通道（${native.reason}）；改用 chrome_snapshot 的 index`)
-          },
-        )
+        const replace = args?.replace === true
         const enter = args?.pressEnter === true
-        if (enter) {
-          const driver = await nativeDriver()
-          if (driver !== undefined) {
-            const live = await call('tabs.get', { tabId })
-            await driver.call('key', { key: 'enter', title: live.tab.title })
-          } else {
-            await call('page.key', { tabId, key: 'Enter' })
-          }
-        }
+        const outcome = await runChannels([
+          {
+            name: 'cdp',
+            run: async () => {
+              const hit = await cdpLocate(tabId, name)
+              await cdpClick(tabId, hit.x, hit.y, { glide: 150 })
+              if (replace) await cdpSelectAll(tabId)
+              await cdpType(tabId, value)
+              if (enter) await cdpKey(tabId, cdpKeySpec('enter'))
+              return { element: hit.tag, label: hit.label }
+            },
+          },
+          {
+            name: 'native',
+            run: async () => {
+              const driver = await requireDriver()
+              const tab = await focusableTab(tabId)
+              const result = await driver.call('type', { name, text: value, replace, title: tab.title })
+              if (enter) await driver.call('key', { key: 'enter', title: tab.title })
+              return result
+            },
+          },
+        ])
+        const channel = outcome.channel
         return {
-          text: `Typed ${value.length} characters into ${name} via trusted key events`
-            + `${enter ? ' and pressed Enter' : ''}.`,
+          text: `Typed ${value.length} characters into "${name}" via trusted key events on the ${channel} channel`
+            + `${enter ? ', then pressed Enter' : ''}.`,
         }
       }
 
