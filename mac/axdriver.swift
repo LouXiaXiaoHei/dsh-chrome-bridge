@@ -489,6 +489,13 @@ final class Driver {
         guard let pid = currentPid else { return (false, "Chrome 未运行") }
         var typed = 0
         for ch in text {
+            // A newline has no unicode payload an editor will honour — it has to be
+            // the Return key, or multi-line input collapses into one long line.
+            if ch == "\n" {
+                _ = tapKey(36)
+                typed += 1
+                continue
+            }
             let s = String(ch)
             var units = Array(s.utf16)
             if let down = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true) {

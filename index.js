@@ -192,9 +192,28 @@ export function apply(ctx, config) {
     return tabId
   }
 
+  /**
+   * A tab the user has closed keeps answering nothing: `chrome.scripting` gives up quietly
+   * and the host waits out the whole tool timeout. Asking first turns that minute of silence
+   * into one cheap round trip and a sentence the reader can act on.
+   */
+  const ensureTabAlive = async (tabId) => {
+    try {
+      await bridge.call('tabs.get', { tabId }, { timeoutMs: 4000 })
+    } catch (error) {
+      const message = String(error?.message ?? error)
+      if (!/no tab with id/iu.test(message)) return
+      throw new Error(
+        `Tab ${tabId} is gone — it was closed after it was selected. Call chrome_tabs to see what is open, `
+        + 'or ask the user to @ the tab again.',
+      )
+    }
+  }
+
   /** One extension round trip against the tab's page. */
   const call = async (method, params) => {
     if (!bridge.connected) throw await disconnected()
+    if (typeof params?.tabId === 'number' && Number.isFinite(params.tabId)) await ensureTabAlive(params.tabId)
     const result = await bridge.call(method, params, { timeoutMs: settings.toolTimeoutMs })
     if (result && typeof result === 'object' && typeof result.error === 'string') throw new Error(result.error)
     return result
@@ -346,10 +365,50 @@ export function apply(ctx, config) {
     params: { type, x, y, ...extra },
   })
 
-  /** Slide the pointer over, press, release, and let a ripple confirm it. */
-  const cdpClick = async (tabId, x, y, { glide = 190, settle = 40 } = {}) => {
+  /**
+   * How long a slide should take, decided by the distance the pointer has to cover —
+   * long trips get a visible sweep, short corrections stay quick. Running the maths
+   * inside the page keeps it to one round trip: no position has to travel back here.
+   */
+  const slideExpression = (x, y) => `(() => {
+    const el = document.getElementById('__dsh_ai_cursor')
+    if (!el) return { present: false }
+    const m = new DOMMatrixReadOnly(getComputedStyle(el).transform)
+    const fromX = m.m41 + 1.6
+    const fromY = m.m42 + 1.2
+    const distance = Math.hypot(${x} - fromX, ${y} - fromY)
+    const duration = Math.max(240, Math.min(780, 240 + distance * 0.55))
+    el.style.transition = 'transform ' + duration + 'ms cubic-bezier(.22,.9,.28,1)'
+    el.style.transform = 'translate3d(${(x - 1.6).toFixed(1)}px, ${(y - 1.2).toFixed(1)}px, 0)'
+    return { present: true, duration: Math.round(duration), distance: Math.round(distance) }
+  })()`
+
+  /**
+   * Start the pointer travelling towards (x, y) and report how long that takes, so the
+   * caller can wait for it to arrive instead of acting on a pointer still in flight.
+   * The very first call has nowhere to travel from — it plants the pointer and returns 0.
+   */
+  const moveCursor = async (tabId, x, y) => {
+    try {
+      const outcome = await cdp(tabId, [
+        { method: 'Runtime.evaluate', params: { expression: slideExpression(x, y), returnByValue: true } },
+      ])
+      const value = outcome?.results?.[0]?.result?.value
+      if (value !== null && typeof value === 'object' && value.present === true) {
+        return Number(value.duration) || 0
+      }
+    } catch {
+      // Injection may be refused (chrome:// pages); fall through to the plain attempt.
+    }
+    // No pointer on the page yet: plant it, then let the caller act immediately.
     await cursor(tabId, { x, y })
-    if (glide > 0) await sleep(glide)
+    return 0
+  }
+
+  /** Slide the pointer over, wait for it to land, press, release, then ripple. */
+  const cdpClick = async (tabId, x, y, { hover = 80, settle = 40 } = {}) => {
+    const travel = await moveCursor(tabId, x, y)
+    await sleep(travel + hover)
     await cdp(tabId, [
       mouseEvent('mouseMoved', x, y, { buttons: 0 }),
       { ...mouseEvent('mousePressed', x, y, { button: 'left', buttons: 1, clickCount: 1 }), wait: settle },
@@ -451,41 +510,82 @@ export function apply(ctx, config) {
   }
 
   /** Type text as keyboard events: printable ASCII carries its own key code, everything else goes in as text. */
-  const cdpType = async (tabId, text) => {
-    const calls = []
+  /**
+   * Type a string one character at a time. Firing everything in a single batch makes
+   * the text appear between two frames, which reads as a paste rather than as typing;
+   * small batches with a breath between them let the page paint as it goes.
+   */
+  const cdpType = async (tabId, text, { chunk = 16, pace = 18 } = {}) => {
+    const pieces = []
     for (const ch of text) {
       if (ch === '\n') {
-        calls.push({ method: 'Input.dispatchKeyEvent', params: { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' } })
-        calls.push({ method: 'Input.dispatchKeyEvent', params: { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 } })
+        pieces.push([
+          { method: 'Input.dispatchKeyEvent', params: { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' } },
+          { method: 'Input.dispatchKeyEvent', params: { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 } },
+        ])
         continue
       }
       // Printable ASCII: a full key down/up pair, so keydown → keypress → input → keyup.
       if (ch >= ' ' && ch <= '~') {
         const spec = ch === ' ' ? { key: ' ', code: 'Space', windowsVirtualKeyCode: 32 } : cdpKeySpec(ch)
-        calls.push({ method: 'Input.dispatchKeyEvent', params: { type: 'keyDown', text: ch, unmodifiedText: ch, ...spec } })
-        calls.push({ method: 'Input.dispatchKeyEvent', params: { type: 'keyUp', ...spec } })
+        pieces.push([
+          { method: 'Input.dispatchKeyEvent', params: { type: 'keyDown', text: ch, unmodifiedText: ch, ...spec } },
+          { method: 'Input.dispatchKeyEvent', params: { type: 'keyUp', ...spec } },
+        ])
         continue
       }
       // Chinese, emoji and anything else with no key code: the browser commits it as text.
-      calls.push({ method: 'Input.insertText', params: { text: ch } })
+      pieces.push([{ method: 'Input.insertText', params: { text: ch } }])
     }
-    if (calls.length > 0) await cdp(tabId, calls)
-    return calls.length
+
+    let sent = 0
+    for (let start = 0; start < pieces.length; start += chunk) {
+      const group = pieces.slice(start, start + chunk)
+      await cdp(tabId, group.flat())
+      sent += group.length
+      if (start + chunk < pieces.length) await sleep(pace)
+    }
+    return sent
   }
 
   /** Press at one point, glide to another, release — the sequence sliders and sortables expect. */
+  /**
+   * Press at one point, drag to another, release. The pointer is moved in the page
+   * between legs as well, so what the eye follows and what the page receives stay
+   * together — a slider being dragged looks dragged, not teleported.
+   */
   const cdpDrag = async (tabId, from, to, steps) => {
-    await cursor(tabId, { x: from[0], y: from[1] })
-    await sleep(160)
-    const calls = [mouseEvent('mousePressed', from[0], from[1], { button: 'left', buttons: 1, clickCount: 1 })]
-    for (let step = 1; step <= steps; step += 1) {
-      const t = step / steps
-      const x = from[0] + (to[0] - from[0]) * t
-      const y = from[1] + (to[1] - from[1]) * t
-      calls.push({ ...mouseEvent('mouseMoved', x, y, { button: 'left', buttons: 1 }), wait: 12 })
+    const travel = await moveCursor(tabId, from[0], from[1])
+    await sleep(travel + 60)
+    await cursor(tabId, { x: from[0], y: from[1], pressed: true })
+    await sleep(70)
+    await cdp(tabId, [
+      mouseEvent('mouseMoved', from[0], from[1], { buttons: 0 }),
+      { ...mouseEvent('mousePressed', from[0], from[1], { button: 'left', buttons: 1, clickCount: 1 }), wait: 40 },
+    ])
+
+    const legs = Math.max(3, Math.min(steps, 14))
+    for (let leg = 1; leg <= legs; leg += 1) {
+      const body = []
+      const start = (leg - 1) / legs
+      const end = leg / legs
+      const perLeg = Math.max(2, Math.round(steps / legs))
+      for (let slice = 1; slice <= perLeg; slice += 1) {
+        const t = start + ((end - start) * slice) / perLeg
+        const x = from[0] + (to[0] - from[0]) * t
+        const y = from[1] + (to[1] - from[1]) * t
+        body.push({ ...mouseEvent('mouseMoved', x, y, { button: 'left', buttons: 1 }), wait: 10 })
+      }
+      const tipX = from[0] + (to[0] - from[0]) * end
+      const tipY = from[1] + (to[1] - from[1]) * end
+      const legTravel = await moveCursor(tabId, tipX, tipY)
+      await cdp(tabId, body)
+      await sleep(Math.min(legTravel, 140) + 16)
     }
-    calls.push(mouseEvent('mouseReleased', to[0], to[1], { button: 'left', buttons: 0, clickCount: 1 }))
-    await cdp(tabId, calls)
+
+    await cdp(tabId, [
+      { ...mouseEvent('mouseReleased', to[0], to[1], { button: 'left', buttons: 0, clickCount: 1 }), wait: 30 },
+    ])
     await cursor(tabId, { x: to[0], y: to[1], pulse: true })
   }
 
@@ -1022,7 +1122,7 @@ export function apply(ctx, config) {
             name: 'cdp',
             run: async () => {
               const hit = await cdpLocate(tabId, name)
-              await cdpClick(tabId, hit.x, hit.y, { glide: 150 })
+              await cdpClick(tabId, hit.x, hit.y)
               if (replace) await cdpSelectAll(tabId)
               await cdpType(tabId, value)
               if (enter) await cdpKey(tabId, cdpKeySpec('enter'))
@@ -1056,7 +1156,7 @@ export function apply(ctx, config) {
           name: 'cdp',
           run: async () => {
             // Put the caret in the field the way a person does, then type.
-            await cdpClick(tabId, target.x, target.y, { glide: 150 })
+            await cdpClick(tabId, target.x, target.y)
             if (replace) await cdpSelectAll(tabId)
             await cdpType(tabId, value)
             if (enter) await cdpKey(tabId, { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 })
@@ -1191,11 +1291,12 @@ export function apply(ctx, config) {
                 : amount
             const x = Math.round(Math.max(metrics.innerWidth, 1) / 2)
             const y = Math.round(Math.max(metrics.innerHeight, 1) / 2)
-            await cursor(tabId, { x, y })
+            const travel = await moveCursor(tabId, x, y)
+            await sleep(travel + 50)
             await cdp(tabId, [
               { method: 'Input.dispatchMouseEvent', params: { type: 'mouseWheel', x, y, deltaX: 0, deltaY } },
             ])
-            await sleep(120)
+            await sleep(180)
             const after = await call('page.metrics', { tabId })
             return { how: 'cdp', y: after.scrollY, height: after.scrollHeight }
           },
