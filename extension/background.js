@@ -579,6 +579,14 @@ async function capture(tabId) {
 const debuggees = new Set()
 
 /**
+ * 正在出画面的标签页，键是标签页 id，值是这一路的统计。
+ *
+ * 画面只给人看，不喂模型：没人订阅时宿主会把它停掉，所以这里同时是
+ * “这一帧还要不要转发”的开关。
+ */
+const screencasts = new Map()
+
+/**
  * 已经挂着常驻光标的标签页。光标是“这个标签页正在被接管”的标志，
  * 所以它跟着接管走：接管开始就创建，期间一直存在，解除接管才移除。
  */
@@ -701,6 +709,7 @@ try {
   chrome.debugger.onDetach.addListener((source) => {
     if (typeof source.tabId !== 'number') return
     debuggees.delete(source.tabId)
+    screencasts.delete(source.tabId)
     // 调试通道断了（用户打开了 DevTools 等），接管随之结束，光标也不该留在页面上。
     if (engagedTabs.delete(source.tabId)) void ensureCursor(source.tabId, { mode: 'release' })
   })
@@ -710,7 +719,42 @@ try {
 chrome.tabs.onRemoved.addListener((tabId) => {
   debuggees.delete(tabId)
   engagedTabs.delete(tabId)
+  screencasts.delete(tabId)
 })
+
+// 画面帧是扩展主动推的：宿主不开就一帧都不发。
+//
+// ack 必须紧跟事件本身，不能等预览端画完——CDP 在收到 ack 之前不会再给下一帧，
+// 等 UI 就等于让渲染速度决定页面刷新速度。慢的观看者只会丢帧，不会拖慢浏览器。
+try {
+  chrome.debugger.onEvent.addListener((source, method, params) => {
+    if (method !== 'Page.screencastFrame') return
+    const tabId = source?.tabId
+    if (typeof tabId !== 'number' || params === undefined || params === null) return
+    const stats = screencasts.get(tabId)
+    void debuggerApi()
+      .sendCommand({ tabId }, 'Page.screencastFrameAck', { sessionId: params.sessionId })
+      .catch(() => {})
+    if (stats === undefined) return
+    if (typeof params.data === 'string') {
+      stats.frames += 1
+      stats.bytes += params.data.length
+    }
+    send({
+      type: 'event',
+      event: 'screencast.frame',
+      data: {
+        tabId,
+        seq: stats.frames,
+        at: Date.now(),
+        data: params.data,
+        metadata: params.metadata,
+      },
+    })
+  })
+} catch {
+  // 没有 debugger 权限时这条通道不存在，预览自然也就没有。
+}
 
 // 导航会换掉整个文档，光标元素跟着消失。接管期间补回来，所以打开新页面
 // 之后不用等下一次点击，光标就已经在新文档的视口中心了。
@@ -760,6 +804,50 @@ const METHODS = {
       }
     }
     return { results, attached: true }
+  },
+  // 画面：把调试通道里的渲染帧转成预览流。
+  //
+  // 它只给人看，不喂模型：模型要看页面时仍然走 chrome_screenshot，一帧一张图，
+  // 按需付费。start/stop 由宿主按“有没有人在看”开关，没人看时浏览器不用白画。
+  async 'page.screencast'(params) {
+    const tabId = Number(params.tabId)
+    if (!Number.isFinite(tabId)) throw new Error('page.screencast needs a numeric tabId')
+    const action = String(params.action ?? 'start')
+    if (action === 'stop') {
+      const live = screencasts.get(tabId)
+      screencasts.delete(tabId)
+      if (live === undefined) return { ok: true, running: false, frames: 0, bytes: 0 }
+      try {
+        await sendCdp(tabId, 'Page.stopScreencast', {})
+      } catch {
+        // 标签页已经关了、或调试通道已经断了：停不下来也不算失败。
+      }
+      return { ok: true, running: false, frames: live.frames, bytes: live.bytes, startedAt: live.startedAt }
+    }
+    if (action !== 'start') throw new Error(`page.screencast does not know "${action}"`)
+    const clamp = (value, low, high, fallback) => {
+      const number = Number(value)
+      if (!Number.isFinite(number)) return fallback
+      return Math.min(high, Math.max(low, Math.round(number)))
+    }
+    const options = {
+      format: params.format === 'png' ? 'png' : 'jpeg',
+      quality: clamp(params.quality, 1, 100, 60),
+      maxWidth: clamp(params.maxWidth, 160, 1920, 960),
+      maxHeight: clamp(params.maxHeight, 120, 1200, 600),
+      everyNthFrame: clamp(params.everyNthFrame, 1, 10, 1),
+    }
+    const live = screencasts.get(tabId)
+    if (live !== undefined) return { ok: true, running: true, reused: true, ...live.options }
+    const stats = { startedAt: Date.now(), frames: 0, bytes: 0, options }
+    screencasts.set(tabId, stats)
+    try {
+      await sendCdp(tabId, 'Page.startScreencast', options)
+    } catch (error) {
+      screencasts.delete(tabId)
+      throw error
+    }
+    return { ok: true, running: true, ...options }
   },
   async 'page.engage'(params) {
     const tabId = Number(params.tabId)
@@ -951,7 +1039,13 @@ async function connect() {
       next.addEventListener('open', () => {
         socket = next
         lastError = undefined
-        send({ type: 'hello', version: chrome.runtime.getManifest().version })
+        // 老宿主不认识 features，多一个字段不会让它读错；新宿主靠它判断这个
+        // 扩展有没有画面通道，而不是让用户去猜小窗为什么一直是黑的。
+        send({
+          type: 'hello',
+          version: chrome.runtime.getManifest().version,
+          features: ['screencast'],
+        })
         chrome.storage.local.set({ status: 'connected', wsUrl, at: Date.now() })
         settle(next)
       })

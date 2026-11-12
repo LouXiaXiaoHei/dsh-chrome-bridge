@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Browser · 预览</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; height: 100vh; display: flex; flex-direction: column;
+    background: #14161a; color: #e6e8eb;
+    font: 13px/1.5 -apple-system, "SF Pro Text", "PingFang SC", system-ui, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+    border-bottom: 1px solid #262a31; background: #191c21; flex: none;
+    -webkit-app-region: drag;
+  }
+  header > * { -webkit-app-region: no-drag; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #4b5563; flex: none; }
+  .dot.live { background: #34d399; box-shadow: 0 0 0 3px rgba(52, 211, 153, .15); }
+  .dot.warn { background: #fbbf24; }
+  .dot.dead { background: #f87171; }
+  .dot.mine { background: #60a5fa; box-shadow: 0 0 0 3px rgba(96, 165, 250, .18); }
+  #title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 42%; }
+  #url { color: #8b93a1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
+  #meta { color: #6b7280; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  button {
+    background: #242832; color: #d5d9e0; border: 1px solid #333945; border-radius: 6px;
+    padding: 4px 9px; font: inherit; cursor: pointer; white-space: nowrap;
+  }
+  button:hover { background: #2c313d; }
+  button.mine { border-color: #3f6b52; background: #1b2b22; color: #a7f3d0; }
+  main { flex: 1; display: flex; align-items: center; justify-content: center; overflow: hidden; padding: 10px; position: relative; }
+  #screen {
+    max-width: 100%; max-height: 100%; background: #fff; border-radius: 6px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, .45);
+  }
+  #empty {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: #6b7280; text-align: center; padding: 24px; pointer-events: none; white-space: pre-wrap;
+  }
+  footer {
+    display: flex; justify-content: space-between; gap: 12px; padding: 6px 12px;
+    border-top: 1px solid #262a31; color: #6b7280; font-size: 12px; flex: none;
+  }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <strong id="title">等待预览通道…</strong>
+  <span id="url"></span>
+  <span id="meta"></span>
+  <button id="control" type="button">暂停接管</button>
+  <button id="refresh" type="button" title="刷新画面">↻</button>
+  <button id="reconnect" type="button">重连</button>
+</header>
+<main>
+  <canvas id="screen" width="1280" height="800"></canvas>
+  <div id="empty">还没有画面。
+在 Harness 里选一个标签页，模型一动手这里就会亮。</div>
+</main>
+<footer>
+  <span id="hint">画面只给人看，不进模型上下文；模型要看页面时仍需自己截图。</span>
+  <span id="fps"></span>
+</footer>
+<script>
+const canvas = document.getElementById('screen')
+const context = canvas.getContext('2d', { alpha: false })
+const dot = document.getElementById('dot')
+const titleEl = document.getElementById('title')
+const urlEl = document.getElementById('url')
+const metaEl = document.getElementById('meta')
+const fpsEl = document.getElementById('fps')
+const hintEl = document.getElementById('hint')
+const refreshEl = document.getElementById('refresh')
+const emptyEl = document.getElementById('empty')
+const controlEl = document.getElementById('control')
+
+const HINT = '画面只给人看，不进模型上下文；模型要看页面时仍需自己截图。'
+const HINT_MINE = '已暂停 AI：请直接在 Chrome 窗口里操作，完成后点「继续 AI」，模型会重新读一遍页面。'
+// 按需录屏：没人操作时流是停的，画面冻在最后一帧。这是正常状态，不是故障。
+const HINT_FROZEN = '画面停在最后一帧：AI 一动手就自己刷新，想立刻看一眼可以点右上角 ↻。'
+
+let socket
+let retry
+let frames = 0
+let shown = 0
+let bytes = 0
+let lastMeta = ''
+let owner = 'agent'
+let live = false
+let frozen = false
+
+function setState(state, text) {
+  dot.className = 'dot ' + state + (owner === 'user' ? ' mine' : '')
+  if (text !== undefined) titleEl.textContent = text
+}
+
+function applyOwner(next) {
+  owner = next === 'user' ? 'user' : 'agent'
+  controlEl.textContent = owner === 'user' ? '继续 AI' : '暂停接管'
+  controlEl.classList.toggle('mine', owner === 'user')
+  dot.classList.toggle('mine', owner === 'user')
+  metaEl.textContent = owner === 'user' ? '你在操作' : lastMeta
+  hintEl.textContent = owner === 'user' ? HINT_MINE : frozen ? HINT_FROZEN : HINT
+}
+
+function applyFrozen(next) {
+  frozen = next
+  if (owner !== 'user') hintEl.textContent = frozen ? HINT_FROZEN : HINT
+}
+
+function draw(bitmap) {
+  if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+    canvas.width = bitmap.width
+    canvas.height = bitmap.height
+  }
+  context.drawImage(bitmap, 0, 0)
+  emptyEl.style.display = 'none'
+  frames += 1
+  shown += 1
+  live = true
+}
+
+async function handleBlob(blob) {
+  bytes += blob.size
+  try {
+    const bitmap = await createImageBitmap(blob)
+    draw(bitmap)
+    bitmap.close?.()
+  } catch {
+    // 帧损坏就丢掉，下一帧会补上。
+  }
+}
+
+function handleText(text) {
+  let message
+  try { message = JSON.parse(text) } catch { return }
+  if (message.type === 'hello') {
+    setState(message.connected ? 'live' : 'warn', message.connected ? '正在预览' : '扩展没有连上宿主')
+    if (message.tabId !== undefined) urlEl.textContent = 'tab ' + message.tabId
+    if (message.control !== undefined) applyOwner(message.control.owner)
+  } else if (message.type === 'control') {
+    applyOwner(message.owner)
+  } else if (message.type === 'stream') {
+    if (message.running === true) {
+      applyFrozen(false)
+      setState('live', '正在预览')
+      if (frames > 0) emptyEl.style.display = 'none'
+    } else if (message.error) {
+      live = false
+      applyFrozen(false)
+      setState('warn', '预览已停：' + message.error)
+      emptyEl.textContent = String(message.error)
+      emptyEl.style.display = 'flex'
+    } else {
+      // 没有错误就是按需录屏停下来了：画面留着，等下一次操作。
+      live = false
+      applyFrozen(true)
+      // 灰点：不是故障，只是没有东西在动。
+      setState('', '停在最后一帧')
+    }
+  } else if (message.type === 'tab') {
+    titleEl.textContent = message.title || '未命名标签页'
+    urlEl.textContent = message.url || ''
+    document.title = (message.title || 'Browser') + ' · 预览'
+  } else if (message.type === 'meta') {
+    const width = Number(message.deviceWidth) || canvas.width
+    const height = Number(message.deviceHeight) || canvas.height
+    lastMeta = width + '×' + height
+    if (owner !== 'user') metaEl.textContent = lastMeta
+  }
+}
+
+function connect() {
+  clearTimeout(retry)
+  try { socket?.close() } catch { /* 已经关了 */ }
+  setState('warn', '连接中…')
+  const scheme = location.protocol === 'https:' ? 'wss' : 'ws'
+  const endpoint = scheme + '://' + location.host + '/dsh-chrome-tab/preview'
+  socket = new WebSocket(endpoint)
+  socket.binaryType = 'blob'
+  socket.onopen = () => setState('live', '正在预览')
+  // 地址要看得见：连不上时它是唯一能说明「连的是哪儿」的东西。
+  socket.onerror = () => setState('dead', '连不上：' + endpoint)
+  socket.onmessage = (event) => {
+    if (typeof event.data === 'string') handleText(event.data)
+    else handleBlob(event.data)
+  }
+  socket.onclose = (event) => {
+    live = false
+    setState('dead', '预览断开（code ' + (event?.code ?? 0) + '）：' + endpoint + '，正在重连…')
+    retry = setTimeout(connect, 1500)
+  }
+}
+
+// 换手只改一个开关：AI 下一次工具调用会被拒绝，人这边的输入在 Chrome 窗口里
+// 本来就通。乐观更新，失败再翻回来。
+controlEl.addEventListener('click', () => {
+  const next = owner === 'user' ? 'agent' : 'user'
+  const previous = owner
+  applyOwner(next)
+  fetch('/dsh-chrome-tab/control', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ owner: next }),
+  })
+    .then((response) => response.json())
+    .then((state) => applyOwner(state?.owner))
+    .catch(() => applyOwner(previous))
+})
+
+setInterval(() => {
+  fpsEl.textContent = shown + ' fps · ' + (bytes / 1048576).toFixed(1) + ' MB' + (lastMeta ? ' · ' + lastMeta : '')
+  shown = 0
+  bytes = 0
+}, 1000)
+
+refreshEl.addEventListener('click', () => {
+  try { socket?.send(JSON.stringify({ type: 'refresh' })) } catch { /* 没连上就算了 */ }
+})
+document.getElementById('reconnect').addEventListener('click', connect)
+applyOwner('agent')
+connect()
+</script>
+</body>
+</html>

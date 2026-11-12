@@ -1,6 +1,6 @@
 {
   "name": "dsh-chrome-tab",
-  "version": "0.1.4",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "Mention a live Chrome tab with @ and let the agent read and drive it.",
@@ -17,6 +17,8 @@
   "files": [
     "index.js",
     "bridge.js",
+    "preview.js",
+    "preview.html",
     "client.js",
     "cordis.patch.yml",
     "locale/*.json",
@@ -32,6 +34,7 @@
     "client": {
       "inject": [
         "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-sidebar-right",
         "@deepseek-ai/dsh-client-ui-input-trigger"
       ],
       "platform": "web"

@@ -64,7 +64,7 @@ const RETRY_SAFE = new Set([
 const OPCODE = { continuation: 0x0, text: 0x1, binary: 0x2, close: 0x8, ping: 0x9, pong: 0xa }
 
 /** Encode one unmasked server frame. */
-function encodeFrame(opcode, payload) {
+export function encodeFrame(opcode, payload) {
   const length = payload.length
   let header
   if (length < 126) {
@@ -83,8 +83,8 @@ function encodeFrame(opcode, payload) {
   return Buffer.concat([header, payload])
 }
 
-/** One accepted extension socket: incremental frame decoding and lifetime events. */
-class Peer {
+/** One accepted socket: incremental frame decoding and lifetime events. */
+export class Peer {
   #socket
   #buffer = Buffer.alloc(0)
   #fragments = []
@@ -210,6 +210,11 @@ class Peer {
     this.#write(encodeFrame(OPCODE.text, Buffer.from(text, 'utf8')))
   }
 
+  /** 预览流走二进制：一帧 JPEG 原样下发，不 base64，省掉三分之一体积和一次解码。 */
+  sendBinary(buffer) {
+    this.#write(encodeFrame(OPCODE.binary, buffer))
+  }
+
   ping() {
     this.#write(encodeFrame(OPCODE.ping, Buffer.alloc(0)))
   }
@@ -250,6 +255,7 @@ export class TabBridge {
   #info = undefined
   #logger
   #startedAt = undefined
+  #listeners = new Set()
 
   constructor({ logger } = {}) {
     this.#logger = logger
@@ -271,6 +277,32 @@ export class TabBridge {
   /** What the extension last reported about itself, for status surfaces. */
   get info() {
     return this.#info
+  }
+
+  /**
+   * Listen for events the extension pushes on its own.
+   *
+   * 请求/响应只覆盖“宿主问、扩展答”；画面帧没有对应的问句，所以走这条旁路。
+   * 一个订阅者抛错不能拖垮传输，也不能让别的订阅者漏掉同一帧。
+   *
+   * @param listener - called with the event name and its payload.
+   * @returns the disposer removing the subscription.
+   */
+  subscribe(listener) {
+    this.#listeners.add(listener)
+    return () => {
+      this.#listeners.delete(listener)
+    }
+  }
+
+  #emit(name, data) {
+    for (const listener of this.#listeners) {
+      try {
+        listener(name, data)
+      } catch {
+        // 订阅者是宿主自己的代码；它坏了不该影响扩展这一侧。
+      }
+    }
   }
 
   /** WebSocket URL the extension should dial, or undefined before `start`. */
@@ -386,7 +418,18 @@ export class TabBridge {
     }
     if (message === null || typeof message !== 'object') return
     if (message.type === 'hello') {
-      this.#info = { version: String(message.version ?? 'unknown'), at: Date.now() }
+      this.#info = {
+        version: String(message.version ?? 'unknown'),
+        // 扩展会说它会什么；宿主据此决定要不要给模型一个它做不到的工具。
+        features: Array.isArray(message.features) ? message.features.map(String) : [],
+        at: Date.now(),
+      }
+      return
+    }
+    if (message.type === 'event') {
+      // 扩展主动推来的东西（画面帧、页面状态），不是某次调用的回执。
+      const name = String(message.event ?? '')
+      if (name !== '') this.#emit(name, message.data)
       return
     }
     if (typeof message.id !== 'string') return
@@ -399,6 +442,8 @@ export class TabBridge {
   }
 
   #failAll(error) {
+    // 没有人在等回执时，断开是正常收起，不是故障；别拿它吓用户。
+    if (this.#pending.size === 0) return
     const waiting = [...this.#pending.values()].map((pending) => pending.method).filter(Boolean)
     const detail = waiting.length === 0 ? error.message : `${error.message} (while ${waiting.join(', ')} was waiting)`
     this.#logger?.warn?.(`chrome-tab: ${detail}`)

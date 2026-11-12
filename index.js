@@ -19,11 +19,14 @@ import { fileURLToPath } from 'node:url'
 
 import { BRIDGE_PORTS, CONFIG_PATH, TabBridge } from './bridge.js'
 import { AxDriver } from './mac/driver.js'
+import { attachPreview, PREVIEW_PATH } from './preview.js'
 
 const TABS_PATH = '/dsh-chrome-tab/tabs'
 const SELECT_PATH = '/dsh-chrome-tab/select'
 const STATUS_PATH = '/dsh-chrome-tab/status'
 const INSTALL_PATH = '/dsh-chrome-tab/install'
+const CONTROL_PATH = '/dsh-chrome-tab/control'
+const FOCUS_PATH = '/dsh-chrome-tab/focus'
 const EXTENSION_DIR = join(homedir(), '.dsh', 'chrome-tab-extension')
 // The packaged copy is always loadable: if ~/.dsh is not writable (a sandboxed
 // host, a read-only home), Chrome can load unpacked straight from the plugin.
@@ -903,11 +906,24 @@ export function apply(ctx, config) {
           return
         }
         const tab = await remember(tabId)
+        // 换了目标：小窗要先把新页面挂上去，之后就等操作。
+        preview.wantFrame()
         sendJson(response, 200, { ok: true, tab: tab ?? { id: tabId } })
       },
     }),
     'chrome-tab: select route',
   )
+
+  // 桌面版的页面跑在自定义协议上（location.host 就是 "app"），照它拼出来的
+  // WebSocket 地址不可解析：http 请求会被协议处理器接走，升级请求不会。
+  // 这条绝对地址是面板唯一能找到预览通道的入口。
+  const previewWsUrl = () => {
+    try {
+      return ctx.webServer.getOrigin().replace(/^http/, 'ws') + PREVIEW_PATH
+    } catch {
+      return undefined // 监听还没绑上端口
+    }
+  }
 
   ctx.effect(
     () => ctx.webServer.register({
@@ -921,6 +937,8 @@ export function apply(ctx, config) {
           extensionVersion: bridge.info?.version,
           currentTabId,
           currentTab,
+          control: controlState(),
+          preview: { ...preview.stats(), wsUrl: previewWsUrl() },
         })
       },
     }),
@@ -947,9 +965,140 @@ export function apply(ctx, config) {
     'chrome-tab: install route',
   )
 
+  // -------------------------------------------------------------- control lease
+  // 页面只有一个，人和模型不能同时点。谁拿着 lease，谁才能操作；generation
+  // 每次换手加一，好让迟到的动作知道自己已经不是当前主人。
+  let controlOwner = 'agent'
+  let controlGeneration = 0
+  const controlState = () => ({
+    owner: controlOwner,
+    generation: controlGeneration,
+    status: controlOwner === 'user' ? 'paused' : 'active',
+  })
+
+  ctx.effect(
+    () => ctx.webServer.register({
+      kind: 'exact',
+      path: CONTROL_PATH,
+      handler: async (request, response) => {
+        if (request.method !== 'POST') {
+          sendJson(response, 200, controlState())
+          return
+        }
+        const body = await readBody(request)
+        const owner = String(body?.owner ?? '')
+        if (owner !== 'agent' && owner !== 'user') {
+          sendJson(response, 400, { ok: false, error: "owner must be 'agent' or 'user'" })
+          return
+        }
+        if (owner !== controlOwner) {
+          controlOwner = owner
+          controlGeneration += 1
+          preview.broadcastControl(controlState())
+          // 换手后先看一眼此刻的页面，免得接管的人对着半分钟前的画面动手。
+          preview.wantFrame()
+          logger.info?.(`chrome-tab: control handed to ${owner} (generation ${controlGeneration})`)
+        }
+        sendJson(response, 200, { ok: true, ...controlState() })
+      },
+    }),
+    'chrome-tab: control route',
+  )
+
+  // 后台标签页 Chrome 不再合成画面，小窗只能停在最后一帧。面板上那个
+  // 「切到 Chrome」走这里：只换用户看见的标签，不碰页面内容。
+  ctx.effect(
+    () => ctx.webServer.register({
+      kind: 'exact',
+      path: FOCUS_PATH,
+      handler: async (request, response) => {
+        if (request.method !== 'POST') {
+          sendJson(response, 200, { ok: true, tabId: currentTabId })
+          return
+        }
+        const body = await readBody(request)
+        const tabId = Number(body?.tabId ?? currentTabId)
+        if (!Number.isFinite(tabId) || tabId <= 0) {
+          sendJson(response, 400, { ok: false, error: 'tabId must be a positive number' })
+          return
+        }
+        try {
+          await call('tabs.activate', { tabId, focus: true })
+          // 用户把它切到前台就是为了看：补一张，别让画面停在切换前的旧帧上。
+          preview.wantFrame()
+          sendJson(response, 200, { ok: true, tabId })
+        } catch (error) {
+          sendJson(response, 502, { ok: false, error: String(error?.message ?? error) })
+        }
+      },
+    }),
+    'chrome-tab: focus route',
+  )
+
+  // --------------------------------------------------------------- preview face
+  // 画面从扩展的 CDP 会话里来，只走这条本地回环通道；模型看不到它。
+  // 面板关掉、socket 断开都不影响 agent：它只是少了一块屏幕。
+  const preview = attachPreview({
+    bridge,
+    currentTabId: () => currentTabId,
+    control: controlState,
+    logger,
+  })
+
+  ctx.effect(() => () => preview.dispose(), 'chrome-tab: preview channel')
+
+  ctx.effect(
+    () => ctx.webServer.register({
+      kind: 'exact',
+      path: PREVIEW_PATH,
+      handler: (_request, response) => {
+        const html = readFileSync(new URL('./preview.html', import.meta.url))
+        response.writeHead(200, {
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': 'no-store',
+        })
+        response.end(html)
+      },
+    }),
+    'chrome-tab: preview page',
+  )
+
+  // 小窗要的是推送，不是轮询：普通路由接不了 upgrade，这里走宿主留的那个口子。
+  ctx.effect(
+    () => {
+      const server = ctx.webServer
+      if (typeof server?.registerUpgrade !== 'function') {
+        logger.info?.('chrome-tab: this host has no webServer.registerUpgrade; the preview panel stays off')
+        return () => {}
+      }
+      const unregister = server.registerUpgrade({
+        path: PREVIEW_PATH,
+        handler: (request, socket, head) => preview.accept(request, socket, head),
+      })
+      return typeof unregister === 'function' ? unregister : () => {}
+    },
+    'chrome-tab: preview socket',
+  )
+
   // ------------------------------------------------------------------- tools
   const register = (definition) => ctx.effect(
-    () => ctx.tools.register(definition),
+    () => ctx.tools.register({
+      ...definition,
+      execute: async (...args) => {
+        // 用户按下「接管」之后，模型的手要从页面上拿开：这里拒绝，比事后道歉便宜。
+        if (controlOwner === 'user') {
+          throw new Error('用户正在接管这个浏览器标签页。等他们点「继续 AI」之后再操作；在那之前可以先把要做的事说清楚。')
+        }
+        // 小窗按需录：工具跑多久画面就活多久，停下来以后再冻结在最后一帧。
+        // 放在 finally 里，工具抛错也不会把流永远开着。
+        preview.beginActivity()
+        try {
+          return await definition.execute(...args)
+        } finally {
+          preview.endActivity()
+        }
+      },
+    }),
     `chrome-tab: tool ${definition.name}`,
   )
 

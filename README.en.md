@@ -161,6 +161,52 @@ It is a DOM element (`#__dsh_ai_cursor`), not the system cursor. The plugin stac
 
 Black fill, white outline, a soft glow: readable on dark pages thanks to the outline, on light pages thanks to the shadow.
 
+## Browser preview
+
+A live view of the tab the model is driving floats in the top-right corner — the Codex-style little window, except the picture comes from the very tab you use, not from a second headless browser.
+
+The window **is** the picture: no title bar, no padding, no black bars around a page shrunk to fit. Its aspect ratio follows the page viewport, so the frame always fills the whole window. The controls float on top: at rest only a status dot and the page title on the left, an "×" on the right; move the pointer in and the bar lays down a background and hands over the address, the size and the buttons (take over, ↻). Drag that bar to move the window, drag its corner to resize — only the width changes, the height follows the picture's ratio. While you are driving, the buttons stay visible: the picture is frozen then, and you still need a way back to "Hand back to AI".
+
+It is not a second browser. The picture rides the debugger session the extension already holds: `Page.startScreencast` makes Chrome push JPEG frames as the page changes, the extension acks each one right away (without waiting for the UI), hands it to the host over the plugin's own loopback WebSocket, and the host fans it out to the panel. **That path never touches the model** and produces no tool calls; to actually see the page, the model still has to call `chrome_screenshot`.
+
+| Choice | Why |
+| --- | --- |
+| It records only while a tool runs | with the model idle the page is idle too, and a still frame twelve times a second is the same picture |
+| The host keeps the latest frame and pushes every 80 ms | a slow UI drops old frames instead of slowing the renderer down |
+| Every frame is acked immediately | how fast the UI draws cannot set the browser's refresh pace |
+| The picture travels as its own binary frame | not mixed into message JSON, not charged to the model's context |
+| Panel closed, socket gone | the agent's task keeps running, it just loses one screen |
+
+So the picture is **on demand**, not always on: the host starts the stream when a browser tool starts, keeps it alive exactly as long as that tool runs, holds it open two more seconds so animations can finish, then stops. A stopped stream does not go black — it stays on the last frame, with a quiet line along the bottom saying so. That line only shows up when there is something to say (frozen, you are driving, background tab, an error); while it plays, the picture is clean. You never wait for it: the next click or keystroke from the model brings the stream back. To look right now, move the pointer in and press ↻; that asks for a single frame and stops again.
+
+The host also asks for one frame when the panel first connects, when the target tab changes, and when you hand control back to the AI — an empty window cannot show where it is looking.
+
+Once Chrome emits a frame it stays on this machine: extension → loopback WebSocket → host → another loopback WebSocket → panel. Nothing is written to disk and nothing crosses a network card. So `preview.frames` / `preview.bytes` in `/dsh-chrome-tab/status` are **the totals that streamed since the current stream started** — a water meter reading, not storage: the host decodes each frame, keeps only the newest (about 100 KB), and drops the rest on the spot. An animated page can push 1 GB through in five minutes; what stays resident is still one image.
+
+The picture follows the host's **current target tab**: pick another tab in `@` and the window switches over by itself, no reconnect. It floats out the first time you pick a tab, and also when you open the interface while the host already has a target tab, so you never start from an empty window. Once you close it, the model changing targets will not bring it back — picking another tab yourself will. The sidebar guide still offers a full-size panel for long runs.
+
+Chrome only composites the **currently selected tab**. Move the target to the background and the picture freezes; the panel says so at the bottom ("this tab is in Chrome's background") instead of looking broken, and it resumes the moment you switch back. Another app covering the window does not stop the frames.
+
+### Who is driving
+
+The page has one mouse. The top-right of the panel names its owner:
+
+- **AI 操作中**: the model holds control, tools run normally.
+- **你在操作**: after you click it, the host refuses further browser tools (the error names who is driving) and you can click the tab in Chrome yourself. No tool is running while you work, so the picture holds its last frame; press **继续 AI** when you are done and the stream refreshes once. What the model reads is always its own `chrome_snapshot`, never this frame.
+- Click **继续 AI** to hand it back. Every handover bumps `generation`, so a late action cannot be let through because "it used to be it".
+
+Control lives in the host process; the panel and `/dsh-chrome-tab/control` read the same state. It is a brake for humans, not a security boundary: it stops two hands fighting over one mouse, not malicious code.
+
+### Open it as a page
+
+The float, the sidebar panel and a plain page all read the same stream: `http://127.0.0.1:<host port>/dsh-chrome-tab/preview` works in any browser and can watch alongside them.
+
+**Do not open it in the Chrome it shows.** Chrome only composites the current tab: watching the preview page in that same Chrome pushes the target tab into the background and the picture stops at once — you starve it by looking. Use Safari, a second screen, or just the float in the Harness window: it takes no foreground slot in Chrome, which is where the little window belongs.
+
+> In the desktop app the panel runs on `dsh-app://app`, where the page's own `origin` is `"null"` and its `host` is `app` — any address built from them is unresolvable. The panel therefore never guesses: endpoints use relative paths (the main process forwards them to the Host), and the picture address comes from `preview.wsUrl` on `/dsh-chrome-tab/status`.
+>
+> The preview only accepts local connections: same origin, a loopback alias (`127.0.0.1`, `localhost`, `[::1]`), a missing `Origin`, or the literal `null` that the desktop protocol sends. The picture may show pages you are logged in to, so anything else is dropped with a warning.
+
 ## Updating
 
 The extension follows the plugin: on startup the plugin refreshes `extension/` into `~/.dsh/chrome-tab-extension/`, then you click the extension's reload icon on `chrome://extensions` once.
@@ -173,9 +219,9 @@ The Harness plugin itself is updated through plugin management.
 
 ```sh
 node test/bridge.test.js    # 11  dependency-free WS server: handshake, round trip, concurrency, disconnect
-node test/host.test.js      # 44  apply() against a fake ctx: effects, tools, routes
-node test/client.test.js    # 24  the @ source under vm: candidates, filtering, pick, serialization, disconnect reasons
-node test/contract.test.js  # 44  source comparison: method names, ports, paths, tool set on both sides
+node test/host.test.js      # 61  apply() against a fake ctx: effects, tools, routes, control lease
+node test/client.test.js    # 45  the @ source under vm: candidates, filtering, pick, serialization, building and closing the float, filling the window, hover controls, frozen and refresh states
+node test/contract.test.js  # 58  source comparison: method names, ports, paths, tool set on both sides, preview channel, on-demand recording
 node test/e2e.mjs           # 26  real Chrome + real extension + local fixture, end to end
 node test/beacon.mjs        # 8   with two bridges alive, the extension must move to the newest
 node test/smoke.mjs [url]   # 5   a real site (bilibili by default) to see what the model actually reads
@@ -252,6 +298,10 @@ Other cases:
 **Snapshots are capped.** `chrome_snapshot` lists at most 60 interactive elements and 20,000 characters of body text; the accessibility tree is capped at 3,000 nodes, so very large pages can lose elements at the end.
 
 **Do not drive one tab concurrently.** Tool calls are sequential, but if you fire several `chrome_*` calls at once they interleave on the same tab and the outcome gets hard to predict.
+
+**The preview is a preview, not evidence.** Frames are squeezed to 1280×800 at JPEG 70 and small text blurs; to read the page properly use `chrome_screenshot`. Protected pages (`chrome://`, extension pages) have no picture and the panel says why.
+
+**The target tab has to be Chrome's front tab.** Chrome stops compositing a tab that is not current, so screencast frames dry up — the panel names the cause and resumes as soon as you switch back. Another app covering the window is fine.
 
 **`chrome_query` reads live values but runs no page script.** It does CSS selection plus attribute/text reads, not arbitrary evaluation — use `chrome_click` to act on what you find.
 
