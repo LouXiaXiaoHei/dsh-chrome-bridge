@@ -1,0 +1,80 @@
+# 推 v* 标签时：跑测试、打包扩展，把 zip 与 sha256 挂到同版本 GitHub Release，
+# 用户下载解压后就能在 chrome://extensions 里加载。
+# 也可以在 Actions 页面手动触发，用来补发或重发某个版本。
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 要发布的版本号，默认取 extension/manifest.json
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: 单元测试
+        run: npm test
+
+      - name: 确定发布版本
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          manifest=$(node -p "require('./extension/manifest.json').version")
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$INPUT_VERSION" ]; then
+            version="${INPUT_VERSION#v}"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            version="$manifest"
+          else
+            version="${REF_NAME#v}"
+          fi
+          if [ "$version" != "$manifest" ]; then
+            echo "::error::版本不一致：要发布 $version，extension/manifest.json 是 $manifest。先改版本号再打标签。"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: 打包扩展
+        run: node scripts/pack-extension.mjs --version "${{ steps.version.outputs.version }}"
+
+      - name: 发布到 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          title="DSH Chrome Tab Bridge 扩展 v$VERSION"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/*.zip dist/*.sha256 --clobber
+            gh release edit "$tag" --title "$title" --notes-file dist/RELEASE_NOTES.md
+          else
+            gh release create "$tag" dist/*.zip dist/*.sha256 \
+              --title "$title" --notes-file dist/RELEASE_NOTES.md
+          fi
+          {
+            echo "### 扩展已发布"
+            echo ""
+            echo "- 下载：https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/dsh-chrome-tab-extension-v${VERSION}.zip"
+            echo "- 校验：https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/dsh-chrome-tab-extension-v${VERSION}.zip.sha256"
+          } >> "$GITHUB_STEP_SUMMARY"

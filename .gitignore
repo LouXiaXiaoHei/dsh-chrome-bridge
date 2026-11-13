@@ -10,6 +10,9 @@
 /test/probe-geometry.json
 /test/probe-cursor.png
 
+# 打包产物：Release 附件由 CI 现打
+/dist/
+
 # 依赖与本地工具链状态
 node_modules/
 .DS_Store

@@ -48,6 +48,8 @@ On startup the plugin unpacks the extension to `~/.dsh/chrome-tab-extension/` an
 
 Open `chrome://extensions`, turn on **Developer mode**, click **Load unpacked**, and pick that directory.
 
+If you would rather not use the directory the plugin unpacks, download `dsh-chrome-tab-extension-v*.zip` from [Releases](https://github.com/LouXiaXiaoHei/dsh-chrome-bridge/releases) and load the unzipped directory instead. The release workflow runs the unit tests first and attaches a sha256 file next to the zip.
+
 > Chrome 156 and later ignore the `--load-extension` flag, so this manual step is required once. Chrome remembers it afterwards.
 
 The extension needs no port: it probes `30795`–`30805` every 30 seconds and attaches to the bridge with the newest start time, so it follows the newest Harness instance when several are running.

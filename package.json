@@ -27,6 +27,10 @@
     "mac/axdriver.swift",
     "mac/driver.js"
   ],
+  "scripts": {
+    "test": "node test/host.test.js && node test/contract.test.js && node test/bridge.test.js && node test/client.test.js",
+    "pack:extension": "node scripts/pack-extension.mjs"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

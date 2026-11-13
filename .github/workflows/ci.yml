@@ -1,0 +1,40 @@
+# 每次推 main 或提 PR：跑单元测试，再把扩展打成 zip 作为 artifact 留档。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-pack:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: 单元测试
+        run: npm test
+
+      - name: 打包扩展
+        run: node scripts/pack-extension.mjs
+
+      - name: 上传打包结果
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-chrome-tab-extension
+          path: |
+            dist/*.zip
+            dist/*.sha256
+            dist/RELEASE_NOTES.md
+          if-no-files-found: error
+          retention-days: 14

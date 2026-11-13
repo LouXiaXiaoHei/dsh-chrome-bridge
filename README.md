@@ -48,6 +48,8 @@ dsh plugin --profile desktop add link:/path/to/dsh-chrome-bridge
 
 打开 `chrome://extensions` → 右上角打开「开发者模式」→「加载已解压的扩展程序」→ 选择上面那个目录。
 
+不想用插件自动释放的目录时，也可以从 [Releases](https://github.com/LouXiaXiaoHei/dsh-chrome-bridge/releases) 下载 `dsh-chrome-tab-extension-v*.zip`，解压后加载解压出来的目录。发布流程会先跑单元测试，附件里带 sha256 校验文件。
+
 > Chrome 156 起 `--load-extension` 启动参数已被忽略，这一步必须手动做一次。之后 Chrome 会记住，重启不用再来。
 
 扩展不需要填端口：它每 30 秒探测 `30795`–`30805`，挑启动时间最新的那个桥自动连上。多个 Harness 同时开着时，它会跟着最新的那个走。
