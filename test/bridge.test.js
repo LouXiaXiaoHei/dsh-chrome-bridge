@@ -6,9 +6,30 @@
  * reply and a concurrent second call. Run with `node test/bridge.test.js`.
  */
 
-import WebSocket from '/Users/howard/.dsh/profiles/desktop/node_modules/ws/index.js'
+import { createRequire } from 'node:module'
 
 import { TabBridge } from '../bridge.js'
+
+// ws 客户端只给测试用：CI 里由 `npm install --no-save ws@8` 装一份，
+// 本地没有的话退回 DSH profile 自带的那份，不必为跑测试装依赖。
+const require = createRequire(import.meta.url)
+const wsCandidates = [
+  process.env.DSH_WS_MODULE,
+  'ws',
+  '/Users/howard/.dsh/profiles/desktop/node_modules/ws/index.js',
+].filter(Boolean)
+
+let WebSocket
+for (const candidate of wsCandidates) {
+  try {
+    WebSocket = require(candidate)
+    break
+  } catch {}
+}
+if (!WebSocket) {
+  console.error('缺少 ws 客户端：在仓库根跑 `npm install --no-save ws@8`')
+  process.exit(1)
+}
 
 const results = []
 const check = (name, ok, detail) => {

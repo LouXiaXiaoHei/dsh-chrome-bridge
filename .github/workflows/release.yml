@@ -29,6 +29,9 @@ jobs:
         with:
           node-version: 22
 
+      - name: 安装测试依赖
+        run: npm install --no-save ws@8
+
       - name: 单元测试
         run: npm test
 
